@@ -138,36 +138,91 @@
 //! A new version **must not** reorder or remove existing `DataKey` variants
 //! or change the types stored under them; add new variants instead. See
 //! `STORAGE_VERSIONING.md` for the repo-wide rules.
+//!
+//! ## Trait versioning and migration
+//!
+//! The shared `compliance-check` trait returns `CheckResult { allowed, code }`
+//! and requires an `interface_version()` method. This aggregator is built
+//! against interface version [`COMPLIANCE_CHECK_INTERFACE_VERSION`] (currently
+//! `2`). Before invoking any registered primitive's check, the aggregator
+//! calls that primitive's `interface_version()` and refuses the call with
+//! `Error::IncompatibleInterfaceVersion` if it does not match. This prevents
+//! silently misdecoding a primitive that still returns a bare `bool` (version
+//! `1`) or a future shape.
+//!
+//! Migration steps when the trait version changes:
+//!
+//! 1. Upgrade every registered primitive (`denylist-gate`,
+//!    `jurisdiction-flag`, `circuit-breaker`) to a release implementing the
+//!    new `interface_version()` and `CheckResult` shape.
+//! 2. Bump [`COMPLIANCE_CHECK_INTERFACE_VERSION`] here and rebuild/upgrade
+//!    this aggregator.
+//! 3. Consumers reading `CheckResult` must tolerate the new `code` field;
+//!    `code == 0` means "no reason code".
+//!
+//! The per-check `code` is propagated verbatim from the primitive's
+//! `CheckResult.code`; the circuit-breaker check (which does not use the
+//! shared trait) always reports `code == 0`.
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
-    String, Vec,
+    contract, contracterror, contractevent, contractimpl, contractmeta, contracttype, Address,
+    BytesN, Env, String, Vec,
 };
+
+// #809: embed crate version and source repository URL in the deployed WASM so
+// operators can tell which release is live. The release workflow checks these
+// keys are present in every contract WASM.
+contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+contractmeta!(key = "source", val = "https://github.com/stellar/soroban-contracts");
 
 // ---------------------------------------------------------------------------
 // Cross-contract client interfaces
 // ---------------------------------------------------------------------------
 
+/// The `ComplianceCheck` trait interface version this aggregator was built
+/// against. Callers and implementers must agree on this value; see the
+/// "Trait versioning" section of the module docs for the migration rules.
+pub const COMPLIANCE_CHECK_INTERFACE_VERSION: u32 = 2;
+
 /// Subset of the `denylist-gate` interface that this aggregator uses.
 /// Must match the actual contract's exported function signature exactly.
+///
+/// `check` returns the shared `compliance-check` `CheckResult`
+/// (`{ allowed, code }`); the aggregator propagates `code` into its own
+/// per-check breakdown.
 #[soroban_sdk::contractclient(name = "DenylistGateClient")]
 pub trait DenylistGateInterface {
-    fn check(env: Env, address: Address) -> bool;
+    fn interface_version(env: Env) -> u32;
+    fn check(env: Env, address: Address) -> CheckResult;
 }
 
 /// Subset of the `jurisdiction-flag` interface that this aggregator uses.
 /// Must match the actual contract's exported function signature exactly.
 #[soroban_sdk::contractclient(name = "JurisdictionFlagClient")]
 pub trait JurisdictionFlagInterface {
-    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> bool;
+    fn interface_version(env: Env) -> u32;
+    fn is_permitted_jurisdiction(env: Env, address: Address, allowed_codes: Vec<String>) -> CheckResult;
 }
 
 /// Subset of the `circuit-breaker` interface that this aggregator uses.
 /// Must match the actual contract's exported function signature exactly.
 #[soroban_sdk::contractclient(name = "CircuitBreakerClient")]
 pub trait CircuitBreakerInterface {
+    fn interface_version(env: Env) -> u32;
     fn is_frozen(env: Env) -> bool;
+}
+
+/// Result shape returned by the shared `compliance-check` trait. Mirrors
+/// `compliance_check::CheckResult` so the aggregator can decode the value
+/// returned by a primitive without depending on the trait crate at runtime.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimitiveCheckResult {
+    /// `true` if the address passed the check.
+    pub allowed: bool,
+    /// Reason code explaining the outcome (see the `compliance-check` crate).
+    pub code: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +297,10 @@ pub struct CheckResult {
     pub check: CheckKind,
     /// `true` if the address passed the check, `false` if it failed.
     pub passed: bool,
+    /// Reason code propagated from the primitive's `CheckResult.code`.
+    /// `0` means "no reason code" (e.g. the circuit-breaker check, which
+    /// does not use the shared trait).
+    pub code: u32,
 }
 
 /// Identifies which compliance primitive produced a `CheckResult`.
@@ -328,6 +387,10 @@ pub enum Error {
     EmptyAddressList = 5,
     BatchTooLarge = 6,
     ContractPaused = 7,
+    /// A registered primitive reports an `interface_version()` that does not
+    /// match [`COMPLIANCE_CHECK_INTERFACE_VERSION`]. The call is refused
+    /// rather than risking a silent misdecode of the primitive's result.
+    IncompatibleInterfaceVersion = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -557,16 +620,34 @@ impl ComplianceAggregator {
 
     /// Evaluates the circuit-breaker check if one is configured. The result
     /// passes only while the breaker is not frozen.
-    fn circuit_breaker_result(env: &Env) -> Option<CheckResult> {
-        let breaker_addr: Address = env
+    fn circuit_breaker_result(env: &Env) -> Result<Option<CheckResult>, Error> {
+        let breaker_addr: Address = match env
             .storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::CircuitBreaker)?;
-        let frozen = CircuitBreakerClient::new(env, &breaker_addr).is_frozen();
-        Some(CheckResult {
+            .get::<DataKey, Address>(&DataKey::CircuitBreaker)
+        {
+            Some(addr) => addr,
+            None => return Ok(None),
+        };
+        let client = CircuitBreakerClient::new(env, &breaker_addr);
+        Self::verify_interface_version(&client.interface_version())?;
+        let frozen = client.is_frozen();
+        Ok(Some(CheckResult {
             check: CheckKind::CircuitBreaker,
             passed: !frozen,
-        })
+            code: 0,
+        }))
+    }
+
+    /// Verify that a registered primitive's `interface_version()` matches the
+    /// version this aggregator was built against. Returns
+    /// `Error::IncompatibleInterfaceVersion` on mismatch so callers fail
+    /// loudly instead of silently misdecoding the primitive's result.
+    fn verify_interface_version(actual: &u32) -> Result<(), Error> {
+        if *actual != COMPLIANCE_CHECK_INTERFACE_VERSION {
+            return Err(Error::IncompatibleInterfaceVersion);
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -600,7 +681,7 @@ impl ComplianceAggregator {
         // -- circuit-breaker check --
         // Emergency freeze short-circuit: if a configured circuit-breaker is
         // frozen, deny outright without evaluating the underlying checks.
-        if let Some(breaker) = Self::circuit_breaker_result(&env) {
+        if let Some(breaker) = Self::circuit_breaker_result(&env)? {
             let passed = breaker.passed;
             results.push_back(breaker);
             if !passed {
@@ -615,11 +696,13 @@ impl ComplianceAggregator {
             .get::<DataKey, Address>(&DataKey::DenylistGate)
         {
             let client = DenylistGateClient::new(&env, &gate_addr);
-            let passed = client.check(&address);
-            all_passed = all_passed && passed;
+            Self::verify_interface_version(&client.interface_version())?;
+            let primitive = client.check(&address);
+            all_passed = all_passed && primitive.allowed;
             results.push_back(CheckResult {
                 check: CheckKind::Denylist,
-                passed,
+                passed: primitive.allowed,
+                code: primitive.code,
             });
         }
 
@@ -630,14 +713,19 @@ impl ComplianceAggregator {
             .get::<DataKey, Address>(&DataKey::JurisdictionFlag)
         {
             let client = JurisdictionFlagClient::new(&env, &flag_addr);
-            let passed = matches!(
-                    client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
-                    Ok(Ok(true))
-                );
+            Self::verify_interface_version(&client.interface_version())?;
+            let (passed, code) = match client
+                .try_is_permitted_jurisdiction(&address, &allowed_jurisdictions)
+            {
+                Ok(Ok(primitive)) => (primitive.allowed, primitive.code),
+                // A failed or erroring call counts as a failure with no code.
+                _ => (false, 0),
+            };
             all_passed = all_passed && passed;
             results.push_back(CheckResult {
                 check: CheckKind::Jurisdiction,
                 passed,
+                code,
             });
         }
 
@@ -672,7 +760,7 @@ impl ComplianceAggregator {
 
         // Resolve contract addresses once, outside the per-address loop, to
         // avoid redundant storage reads.
-        let breaker: Option<CheckResult> = Self::circuit_breaker_result(&env);
+        let breaker: Option<CheckResult> = Self::circuit_breaker_result(&env)?;
         let gate_addr: Option<Address> = env
             .storage()
             .instance()
@@ -703,25 +791,30 @@ impl ComplianceAggregator {
             if all_passed {
                 if let Some(ref ga) = gate_addr {
                     let client = DenylistGateClient::new(&env, ga);
-                    let passed = client.check(&address);
-                    all_passed = all_passed && passed;
+                    Self::verify_interface_version(&client.interface_version())?;
+                    let primitive = client.check(&address);
+                    all_passed = all_passed && primitive.allowed;
                     results.push_back(CheckResult {
                         check: CheckKind::Denylist,
-                        passed,
+                        passed: primitive.allowed,
+                        code: primitive.code,
                     });
                 }
 
                 if let Some(ref fa) = flag_addr {
                     let client = JurisdictionFlagClient::new(&env, fa);
-                    let passed =
-                        matches!(
-                        client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
-                        Ok(Ok(true))
-                    );
+                    Self::verify_interface_version(&client.interface_version())?;
+                    let (passed, code) = match client
+                        .try_is_permitted_jurisdiction(&address, &allowed_jurisdictions)
+                    {
+                        Ok(Ok(primitive)) => (primitive.allowed, primitive.code),
+                        _ => (false, 0),
+                    };
                     all_passed = all_passed && passed;
                     results.push_back(CheckResult {
                         check: CheckKind::Jurisdiction,
                         passed,
+                        code,
                     });
                 }
             }
@@ -781,16 +874,20 @@ impl ComplianceAggregator {
 
             if let Some(ref ga) = gate_addr {
                 let client = DenylistGateClient::new(&env, ga);
-                all_passed = all_passed && client.check(&address);
+                Self::verify_interface_version(&client.interface_version())?;
+                all_passed = all_passed && client.check(&address).allowed;
             }
 
             if let Some(ref fa) = flag_addr {
                 let client = JurisdictionFlagClient::new(&env, fa);
-                all_passed =
-                    all_passed && matches!(
-                    client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
-                    Ok(Ok(true))
-                );
+                Self::verify_interface_version(&client.interface_version())?;
+                all_passed = all_passed
+                    && match client
+                        .try_is_permitted_jurisdiction(&address, &allowed_jurisdictions)
+                    {
+                        Ok(Ok(primitive)) => primitive.allowed,
+                        _ => false,
+                    };
             }
 
             results.push_back(all_passed);

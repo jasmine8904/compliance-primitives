@@ -38,3 +38,10 @@ path = "fuzz_targets/jurisdiction_multicode_add_remove_sequences.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "jurisdiction_validate_code"
+path = "fuzz_targets/jurisdiction_validate_code.rs"
+test = false
+doc = false
+bench = false

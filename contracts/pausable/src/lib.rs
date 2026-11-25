@@ -72,7 +72,17 @@
 //! emergency freeze (halt-all-transfers signal).
 #![no_std]
 
-use soroban_sdk::{contracttype, Env, String};
+use soroban_sdk::{contractmeta, contracttype, Env, String};
+
+// Embed crate version and repository URL into the WASM custom section so
+// deployed artifacts can be traced back to a release. `contractmeta!` expands
+// to a `#[link_section]` static, which is only meaningful (and only accepted)
+// when compiling for a wasm target; guard it so the plain rlib build still
+// compiles.
+#[cfg(target_family = "wasm")]
+contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+#[cfg(target_family = "wasm")]
+contractmeta!(key = "source", val = env!("CARGO_PKG_REPOSITORY"));
 
 #[contracttype]
 #[derive(Clone)]

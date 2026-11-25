@@ -76,8 +76,12 @@
 //! alongside it and call it after `upgrade`. See `STORAGE_VERSIONING.md`.
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contractmeta, contracttype, Address, Env,
+    String, Vec,
 };
+
+contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+contractmeta!(key = "source", val = env!("CARGO_PKG_REPOSITORY"));
 
 /// Extend the contract's instance storage when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger).
