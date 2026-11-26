@@ -3,9 +3,9 @@
 //!
 //! ## Motivation
 //!
-//! A consuming contract running multiple compliance checks today pays
-//! separate host-level cross-contract call overheads per transfer. This
-//! aggregator reduces that to **one**
+//! A consuming contract running `denylist-gate`, `jurisdiction-flag`, and
+//! `allowlist-token` checks today pays separate host-level cross-contract
+//! call overheads per transfer. This aggregator reduces that to **one**
 //! call from the consumer's perspective: the consumer calls
 //! `check_address` (or the batched `check_all`) on this contract and gets
 //! back a single aggregated pass/fail result plus a per-check breakdown for
@@ -19,9 +19,9 @@
 //!   when the result is `false`. These entrypoints are permissionless and
 //!   require no auth.
 //! - **The admin** (an issuer key or, preferably, a `multisig-admin` contract
-//!   address) calls `initialize`, the check-source configuration methods
-//!   (`set_denylist_gate`, `set_jurisdiction_flag`, `set_allowlist`,
-//!   `set_circuit_breaker`), `set_admin`, pause controls, and `upgrade`.
+//!   address) calls `initialize`, `set_denylist_gate`, `set_jurisdiction_flag`,
+//!   `set_circuit_breaker`, `set_allowlist`, `clear_allowlist`, `set_admin`,
+//!   `pause`, `unpause`, and `upgrade`.
 //!   Every mutation requires the admin's auth.
 //! - **Off-chain tooling and auditors** call the read-only views
 //!   (`get_admin`, `get_config`, `get_checks_summary`, `is_paused`) and consume the
@@ -37,13 +37,12 @@
 //! | `circuit-breaker` | Optional emergency stop. When configured and frozen, every address is denied without running any check. |
 //! | `multisig-admin` | Recommended `admin` value, so reconfiguration needs M-of-N approval. |
 //! | `compliance-pausable` | Shared crate used to guard the pause flag. |
-//! | `policy-engine` | Sibling, not a dependency. This contract is a fixed AND-only fan-out optimised for call overhead; `policy-engine` is the configurable AND / OR layer. Pick one per integration. |
+//! | `policy-engine` | Sibling, not a dependency. This contract is a fixed AND-only fan-out optimised for call overhead; `policy-engine` supports configurable AND / OR policies. |
 //! | `audit-log`, `compliance-check` | Not called by this contract. `audit-log` is the place to record on-chain trails of configuration changes; this contract emits events only. `compliance-check` is a compile-time trait crate and is not used at runtime. |
 //!
-//! Use this contract when a consumer needs an AND-combination of the
-//! denylist, jurisdiction, and/or allowlist primitives, optionally gated by
-//! the emergency breaker. Use `policy-engine` when the policy needs OR
-//! branches or weights.
+//! Use this contract when a consumer needs the AND-combination of the
+//! denylist, jurisdiction, allowlist, and optional circuit-breaker checks.
+//! Use `policy-engine` when the policy needs OR branches or weights.
 //!
 //! ## Contract interfaces used
 //!
@@ -57,8 +56,7 @@
 //!
 //! ## Configured checks
 //!
-//! The admin registers up to one address for each of the three compliance
-//! sources, plus an optional circuit breaker:
+//! The admin registers up to one address for each supported check type:
 //!
 //! - `DenylistCheck` — calls `denylist-gate.check(address) -> bool`
 //! - `JurisdictionCheck` — calls
@@ -67,6 +65,7 @@
 //! - `CircuitBreaker` — calls `circuit-breaker.is_frozen() -> bool`; the check
 //!   passes only while the breaker is not frozen. A frozen breaker denies
 //!   without consulting the other checks.
+//! - `Allowlist` — calls `allowlist-token.is_allowed(address) -> bool`.
 //!
 //! All checks are optional; if a check type's contract address has not been
 //! registered the check is skipped (treated as passing). Registering at least
@@ -87,7 +86,7 @@
 //! | Consumer → aggregator invocations | N | 1 |
 //! | Aggregator instance-storage reads (gate, flag, breaker, allowlist) | 4 × N | 4 |
 //! | `circuit-breaker.is_frozen` calls | N | 1 |
-//! | Downstream primitive calls (denylist + jurisdiction + allowlist) | up to 3 × N | up to 3 × N |
+//! | Downstream primitive calls | Up to 4 × N | 1 breaker call + up to 3 × N |
 //! | Return payload | N × `(bool, Vec<CheckResult>)` | 1 × `Vec<AddressCheckResult>` (also carries each `Address`) |
 //!
 //! The recorded `check_address` baseline (denylist and jurisdiction checks,
@@ -96,20 +95,20 @@
 //! (`[compliance-aggregator.check_address]` in `budget-baselines.toml`).
 //! Almost all of that is the downstream calls, so the cost model is:
 //!
-//! - `check_address` × N ≈ N × (aggregator frame + 4 reads + up to 3 downstream calls)
-//! - `check_all` ≈ 1 × (aggregator frame + 4 reads) + N × (up to 3 downstream calls)
+//! - `check_address` × N ≈ N × (aggregator frame + 4 reads + downstream calls)
+//! - `check_all` ≈ 1 × (aggregator frame + 4 reads) + N × downstream calls
 //!
 //! Guidance for a token's `transfer` path, at representative batch sizes:
 //!
 //! | Batch size | Typical shape | Recommendation |
 //! |---|---|---|
 //! | 1 | Single sender check | `check_address`: smallest return value, no `Address` echoed back. |
-//! | 2 | Sender + recipient (the common `transfer` case) | Either. `check_all` saves one aggregator frame, 3 storage reads and one breaker call; `check_address` × 2 is simpler to branch on. The difference is small next to the 4 downstream calls both make. |
+//! | 2 | Sender + recipient (the common `transfer` case) | Either. `check_all` saves one aggregator frame, 4 storage reads and one breaker call; `check_address` × 2 is simpler to branch on. |
 //! | 5–10 | Multi-party settlement, batch payouts | `check_all` (or `batch_check` if you only need booleans). The saved fixed overhead grows linearly with N. |
 //! | 25–45 | Bulk distribution, airdrop pre-screen | `batch_check`, which caps input at `MAX_BATCH_SIZE` (45). `check_all` has no cap, and its per-address `Vec<CheckResult>` breakdown makes the return payload the largest memory cost at this size. Split anything above 45 across transactions. |
 //!
-//! Total cost at every size is dominated by downstream calls, which
-//! neither entry point avoids. Batching only removes the per-invocation
+//! For the baseline configuration, total cost is dominated by the 2 × N
+//! downstream calls, which neither entry point avoids. Batching only removes the per-invocation
 //! overhead. Per-size figures for the configuration above come from
 //! `bench_check_address_vs_check_all_batch_sizes` in `src/test.rs`:
 //!
@@ -150,8 +149,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
-    String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -179,7 +177,7 @@ pub trait CircuitBreakerInterface {
     fn is_frozen(env: Env) -> bool;
 }
 
-/// Subset of the `allowlist-token` interface used by this aggregator.
+/// Subset of the `allowlist-token` interface that this aggregator uses.
 #[soroban_sdk::contractclient(name = "AllowlistTokenClient")]
 pub trait AllowlistTokenInterface {
     fn is_allowed(env: Env, address: Address) -> bool;
@@ -192,7 +190,8 @@ pub trait AllowlistTokenInterface {
 /// TTL policy for this contract's stored state.
 ///
 /// Every piece of configuration the aggregator keeps (`Admin`,
-/// `DenylistGate`, `JurisdictionFlag`, `CircuitBreaker`, and the pause flag)
+/// `DenylistGate`, `JurisdictionFlag`, `CircuitBreaker`, `AllowlistToken`,
+/// and the pause flag)
 /// lives in **instance** storage, which shares a single TTL with the contract
 /// instance itself. If that TTL lapses the whole contract is archived and
 /// every call fails until someone submits a manual restore.
@@ -222,9 +221,7 @@ pub(crate) const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; //
 /// entry) according to the policy documented above. Called from every
 /// storage write path.
 fn extend_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,23 +240,13 @@ enum DataKey {
     /// Address of the `circuit-breaker` contract to consult, if any. When
     /// set and frozen, all checks short-circuit to deny.
     CircuitBreaker,
-    /// Address of the `allowlist-token` contract to call, if any.
+    /// Address of the `allowlist-token` contract to consult, if any.
     AllowlistToken,
 }
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
-
-/// The result of a single compliance check on a single address.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckResult {
-    /// Human-readable label identifying which check produced this result.
-    pub check: CheckKind,
-    /// `true` if the address passed the check, `false` if it failed.
-    pub passed: bool,
-}
 
 /// Identifies which compliance primitive produced a `CheckResult`.
 #[contracttype]
@@ -271,22 +258,32 @@ pub enum CheckKind {
     Allowlist = 3,
 }
 
-/// Stable reason codes returned by the verbose check endpoints.
+/// Stable failure codes emitted alongside a failed compliance check.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CheckFailureCode {
-    Denylisted = 0,
-    JurisdictionNotPermitted = 1,
-    CircuitBreakerFrozen = 2,
-    NotAllowlisted = 3,
+    Denylisted = 1,
+    JurisdictionNotPermitted = 2,
+    CircuitBreakerFrozen = 3,
+    NotAllowlisted = 4,
 }
 
-/// Identifies the first check that caused an aggregated check to fail.
+/// Machine-readable reason why a compliance check failed.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CheckFailure {
     pub source: CheckKind,
     pub code: CheckFailureCode,
+}
+
+/// The result of a single compliance check on a single address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckResult {
+    /// Human-readable label identifying which check produced this result.
+    pub check: CheckKind,
+    /// `true` if the address passed the check, `false` if it failed.
+    pub passed: bool,
 }
 
 /// Per-address aggregated result returned by `check_all`.
@@ -296,20 +293,17 @@ pub struct AddressCheckResult {
     pub address: Address,
     /// `true` iff every registered check passed for this address.
     pub all_passed: bool,
-    /// Individual results in deterministic order (breaker, denylist,
-    /// jurisdiction, then allowlist).
+    /// Individual results in registration order.
     pub checks: Vec<CheckResult>,
 }
 
-/// Per-address result returned by `check_all_verbose`.
+/// Detailed per-address result returned by `check_all_with_failures`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerboseAddressCheckResult {
+pub struct DetailedAddressCheckResult {
     pub address: Address,
     pub all_passed: bool,
-    pub checks: Vec<CheckResult>,
-    pub failure_source: Option<Symbol>,
-    pub failure_code: Option<Symbol>,
+    pub failures: Vec<CheckFailure>,
 }
 
 /// Configuration of this aggregator instance, returned by `get_config`.
@@ -439,25 +433,18 @@ impl ComplianceAggregator {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        AdminSet {
-            admin: admin.clone(),
-        }
-        .publish(&env);
+        AdminSet { admin: admin.clone() }.publish(&env);
 
         if let Some(gate) = denylist_gate {
             env.storage().instance().set(&DataKey::DenylistGate, &gate);
             DenylistGateSet { gate }.publish(&env);
         }
         if let Some(flag) = jurisdiction_flag {
-            env.storage()
-                .instance()
-                .set(&DataKey::JurisdictionFlag, &flag);
+            env.storage().instance().set(&DataKey::JurisdictionFlag, &flag);
             JurisdictionFlagSet { flag }.publish(&env);
         }
         if let Some(breaker) = circuit_breaker {
-            env.storage()
-                .instance()
-                .set(&DataKey::CircuitBreaker, &breaker);
+            env.storage().instance().set(&DataKey::CircuitBreaker, &breaker);
             CircuitBreakerSet { breaker }.publish(&env);
         }
         extend_instance_ttl(&env);
@@ -515,11 +502,19 @@ impl ComplianceAggregator {
     pub fn set_jurisdiction_flag(env: Env, admin: Address, flag: Address) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::JurisdictionFlag, &flag);
+        env.storage().instance().set(&DataKey::JurisdictionFlag, &flag);
         extend_instance_ttl(&env);
         JurisdictionFlagSet { flag }.publish(&env);
+        Ok(())
+    }
+
+    /// Register or replace the `allowlist-token` contract address. Admin-only.
+    pub fn set_allowlist(env: Env, admin: Address, allowlist: Address) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AllowlistToken, &allowlist);
+        extend_instance_ttl(&env);
+        AllowlistTokenSet { allowlist }.publish(&env);
         Ok(())
     }
 
@@ -557,14 +552,21 @@ impl ComplianceAggregator {
         Ok(())
     }
 
+    /// Unregister the `allowlist-token` check. Admin-only.
+    pub fn clear_allowlist(env: Env, admin: Address) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().remove(&DataKey::AllowlistToken);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Register or replace the `circuit-breaker` contract address. Admin-only.
     /// Pass this to enable emergency-freeze short-circuiting of all checks.
     pub fn set_circuit_breaker(env: Env, admin: Address, breaker: Address) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::CircuitBreaker, &breaker);
+        env.storage().instance().set(&DataKey::CircuitBreaker, &breaker);
         extend_instance_ttl(&env);
         CircuitBreakerSet { breaker }.publish(&env);
         Ok(())
@@ -600,11 +602,7 @@ impl ComplianceAggregator {
     /// section for the full procedure.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        UpgradePerformed {
-            admin,
-            new_wasm_hash: new_wasm_hash.clone(),
-        }
-        .publish(&env);
+        UpgradePerformed { admin, new_wasm_hash: new_wasm_hash.clone() }.publish(&env);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -617,10 +615,7 @@ impl ComplianceAggregator {
     ///
     /// Returns `Error::NotInitialized` if `initialize` has not been called.
     pub fn get_admin(env: Env) -> Result<Address, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+        env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
     }
 
     /// Returns the currently registered `denylist-gate` address, if any.
@@ -633,36 +628,27 @@ impl ComplianceAggregator {
         env.storage().instance().get(&DataKey::JurisdictionFlag)
     }
 
-    /// Returns the currently registered `allowlist-token` address, if any.
-    pub fn allowlist_token(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::AllowlistToken)
-    }
-
-    /// Returns whether the denylist, jurisdiction, and allowlist checks are
-    /// configured without requiring separate view calls.
-    pub fn get_checks_summary(env: Env) -> (bool, bool, bool) {
-        let denylist_gate: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::DenylistGate);
-        let jurisdiction_flag: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::JurisdictionFlag);
-        let allowlist_token: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::AllowlistToken);
-        (
-            denylist_gate.is_some(),
-            jurisdiction_flag.is_some(),
-            allowlist_token.is_some(),
-        )
+    /// Returns whether each check source is configured, in denylist,
+    /// jurisdiction, circuit-breaker, allowlist order.
+    pub fn get_checks_summary(env: Env) -> (bool, bool, bool, bool) {
+        let denylist_gate: Option<Address> = env.storage().instance().get::<DataKey, Address>(&DataKey::DenylistGate);
+        let jurisdiction_flag: Option<Address> =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::JurisdictionFlag);
+        let circuit_breaker: Option<Address> =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::CircuitBreaker);
+        let allowlist_token: Option<Address> =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::AllowlistToken);
+        (denylist_gate.is_some(), jurisdiction_flag.is_some(), circuit_breaker.is_some(), allowlist_token.is_some())
     }
 
     /// Returns the currently registered `circuit-breaker` address, if any.
     pub fn circuit_breaker(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::CircuitBreaker)
+    }
+
+    /// Returns the currently registered `allowlist-token` address, if any.
+    pub fn allowlist_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AllowlistToken)
     }
 
     /// Returns the current configuration of this aggregator instance, including
@@ -679,15 +665,36 @@ impl ComplianceAggregator {
     /// Evaluates the circuit-breaker check if one is configured. The result
     /// passes only while the breaker is not frozen.
     fn circuit_breaker_result(env: &Env) -> Option<CheckResult> {
-        let breaker_addr: Address = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::CircuitBreaker)?;
+        let breaker_addr: Address = env.storage().instance().get::<DataKey, Address>(&DataKey::CircuitBreaker)?;
         let frozen = CircuitBreakerClient::new(env, &breaker_addr).is_frozen();
-        Some(CheckResult {
-            check: CheckKind::CircuitBreaker,
-            passed: !frozen,
-        })
+        Some(Self::check_result(CheckKind::CircuitBreaker, !frozen))
+    }
+
+    fn check_result(check: CheckKind, passed: bool) -> CheckResult {
+        CheckResult { check, passed }
+    }
+
+    fn failure_for_result(result: &CheckResult) -> Option<CheckFailure> {
+        if result.passed {
+            return None;
+        }
+        let code = match result.check {
+            CheckKind::Denylist => CheckFailureCode::Denylisted,
+            CheckKind::Jurisdiction => CheckFailureCode::JurisdictionNotPermitted,
+            CheckKind::CircuitBreaker => CheckFailureCode::CircuitBreakerFrozen,
+            CheckKind::Allowlist => CheckFailureCode::NotAllowlisted,
+        };
+        Some(CheckFailure { source: result.check, code })
+    }
+
+    fn failures_for_results(env: &Env, results: &Vec<CheckResult>) -> Vec<CheckFailure> {
+        let mut failures = Vec::new(env);
+        for result in results.iter() {
+            if let Some(failure) = Self::failure_for_result(&result) {
+                failures.push_back(failure);
+            }
+        }
+        failures
     }
 
     // -----------------------------------------------------------------------
@@ -699,24 +706,13 @@ impl ComplianceAggregator {
     ///
     /// - `allowed_jurisdictions`: the set of permitted jurisdiction codes
     ///   passed through to `jurisdiction-flag.is_permitted_jurisdiction`.
-    ///   Ignored (and not forwarded) if no jurisdiction-flag contract is
-    ///   registered.
+    /// Ignored if no jurisdiction-flag contract is registered.
     ///
     /// Returns `(all_passed, checks)` where:
     /// - `all_passed` is `true` iff every registered check returned `true`.
-    /// - `checks` is the per-primitive result list in deterministic order
-    ///   (breaker first when configured, then denylist, jurisdiction, and
-    ///   allowlist) for auditability.
+    /// - `checks` is the per-primitive result list in deterministic order.
     ///
-    /// Returns `Error::NoChecksRegistered` if no check has been configured.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // `aggregator` is a `ComplianceAggregatorClient` for the deployed contract.
-    /// let allowed = soroban_sdk::vec![&env, String::from_str(&env, "US")];
-    /// let (all_passed, checks) = aggregator.check_address(&holder, &allowed);
-    /// ```
+    /// Returns `Error::NoChecksRegistered` if no check source is configured.
     pub fn check_address(
         env: Env,
         address: Address,
@@ -737,36 +733,26 @@ impl ComplianceAggregator {
         }
 
         // -- denylist-gate check --
-        if let Some(gate_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::DenylistGate)
-        {
+        if let Some(gate_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::DenylistGate) {
             let client = DenylistGateClient::new(&env, &gate_addr);
             let passed = client.check(&address);
             all_passed = all_passed && passed;
-            results.push_back(CheckResult {
-                check: CheckKind::Denylist,
-                passed,
-            });
+            results.push_back(Self::check_result(CheckKind::Denylist, passed));
         }
 
         // -- jurisdiction-flag check --
-        if let Some(flag_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::JurisdictionFlag)
-        {
+        if let Some(flag_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::JurisdictionFlag) {
             let client = JurisdictionFlagClient::new(&env, &flag_addr);
-            let passed = matches!(
-                    client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
-                    Ok(Ok(true))
-                );
+            let passed = matches!(client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions), Ok(Ok(true)));
             all_passed = all_passed && passed;
-            results.push_back(CheckResult {
-                check: CheckKind::Jurisdiction,
-                passed,
-            });
+            results.push_back(Self::check_result(CheckKind::Jurisdiction, passed));
+        }
+
+        // -- allowlist-token check --
+        if let Some(allowlist_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::AllowlistToken) {
+            let passed = AllowlistTokenClient::new(&env, &allowlist_addr).is_allowed(&address);
+            all_passed = all_passed && passed;
+            results.push_back(Self::check_result(CheckKind::Allowlist, passed));
         }
 
         // -- allowlist-token check --
@@ -791,17 +777,15 @@ impl ComplianceAggregator {
         Ok((all_passed, results))
     }
 
-    /// Like `check_address`, with the source and code for the first failed
-    /// check. `check_address` remains available with its original return type.
-    pub fn check_address_verbose(
+    /// Detailed variant of `check_address` that returns a structured reason
+    /// for each failed source while preserving the overall boolean result.
+    pub fn check_address_with_failures(
         env: Env,
         address: Address,
         allowed_jurisdictions: Vec<String>,
-    ) -> Result<(bool, Vec<CheckResult>, Option<CheckFailure>), Error> {
-        let (all_passed, checks) =
-            Self::check_address(env, address, allowed_jurisdictions)?;
-        let failure = Self::failure_for_checks(&checks);
-        Ok((all_passed, checks, failure))
+    ) -> Result<(bool, Vec<CheckFailure>), Error> {
+        let (all_passed, results) = Self::check_address(env.clone(), address, allowed_jurisdictions)?;
+        Ok((all_passed, Self::failures_for_results(&env, &results)))
     }
 
     /// Batched variant of `check_address` for multiple addresses in one call.
@@ -829,24 +813,12 @@ impl ComplianceAggregator {
         // Resolve contract addresses once, outside the per-address loop, to
         // avoid redundant storage reads.
         let breaker: Option<CheckResult> = Self::circuit_breaker_result(&env);
-        let gate_addr: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::DenylistGate);
-        let flag_addr: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::JurisdictionFlag);
-        let allowlist_addr: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::AllowlistToken);
+        let gate_addr: Option<Address> = env.storage().instance().get::<DataKey, Address>(&DataKey::DenylistGate);
+        let flag_addr: Option<Address> = env.storage().instance().get::<DataKey, Address>(&DataKey::JurisdictionFlag);
+        let allowlist_addr: Option<Address> =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::AllowlistToken);
 
-        if breaker.is_none()
-            && gate_addr.is_none()
-            && flag_addr.is_none()
-            && allowlist_addr.is_none()
-        {
+        if breaker.is_none() && gate_addr.is_none() && flag_addr.is_none() && allowlist_addr.is_none() {
             return Err(Error::NoChecksRegistered);
         }
 
@@ -869,24 +841,21 @@ impl ComplianceAggregator {
                     let client = DenylistGateClient::new(&env, ga);
                     let passed = client.check(&address);
                     all_passed = all_passed && passed;
-                    results.push_back(CheckResult {
-                        check: CheckKind::Denylist,
-                        passed,
-                    });
+                    results.push_back(Self::check_result(CheckKind::Denylist, passed));
                 }
 
                 if let Some(ref fa) = flag_addr {
                     let client = JurisdictionFlagClient::new(&env, fa);
                     let passed =
-                        matches!(
-                        client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
-                        Ok(Ok(true))
-                    );
+                        matches!(client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions), Ok(Ok(true)));
                     all_passed = all_passed && passed;
-                    results.push_back(CheckResult {
-                        check: CheckKind::Jurisdiction,
-                        passed,
-                    });
+                    results.push_back(Self::check_result(CheckKind::Jurisdiction, passed));
+                }
+
+                if let Some(ref allowlist) = allowlist_addr {
+                    let passed = AllowlistTokenClient::new(&env, allowlist).is_allowed(&address);
+                    all_passed = all_passed && passed;
+                    results.push_back(Self::check_result(CheckKind::Allowlist, passed));
                 }
 
                 if let Some(ref aa) = allowlist_addr {
@@ -900,39 +869,29 @@ impl ComplianceAggregator {
                 }
             }
 
-            batch.push_back(AddressCheckResult {
-                address,
-                all_passed,
-                checks: results,
-            });
+            batch.push_back(AddressCheckResult { address, all_passed, checks: results });
         }
 
         Ok(batch)
     }
 
-    /// Batched variant of `check_all` that adds first-failure detail for each
-    /// address. `check_all` retains its existing result shape.
-    pub fn check_all_verbose(
+    /// Detailed variant of `check_all` that includes structured failure
+    /// reasons while retaining the per-address boolean result.
+    pub fn check_all_with_failures(
         env: Env,
         addresses: Vec<Address>,
         allowed_jurisdictions: Vec<String>,
-    ) -> Result<Vec<VerboseAddressCheckResult>, Error> {
+    ) -> Result<Vec<DetailedAddressCheckResult>, Error> {
         let results = Self::check_all(env.clone(), addresses, allowed_jurisdictions)?;
-        let mut verbose = Vec::new(&env);
+        let mut detailed = Vec::new(&env);
         for result in results.iter() {
-            let failure = Self::failure_for_checks(&result.checks);
-            verbose.push_back(VerboseAddressCheckResult {
+            detailed.push_back(DetailedAddressCheckResult {
                 address: result.address,
                 all_passed: result.all_passed,
-                failure_source: failure
-                    .clone()
-                    .map(|failure| Self::check_kind_symbol(&env, failure.source)),
-                failure_code: failure
-                    .map(|failure| Self::check_failure_code_symbol(&env, failure.code)),
-                checks: result.checks,
+                failures: Self::failures_for_results(&env, &result.checks),
             });
         }
-        Ok(verbose)
+        Ok(detailed)
     }
 
     /// Lightweight batched entrypoint: evaluates the configured policy for
@@ -960,33 +919,22 @@ impl ComplianceAggregator {
             return Err(Error::BatchTooLarge);
         }
 
-        let breaker = Self::circuit_breaker_result(&env);
-        let gate_addr: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::DenylistGate);
-        let flag_addr: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::JurisdictionFlag);
-        let allowlist_addr: Option<Address> = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::AllowlistToken);
+        let breaker: Option<CheckResult> = Self::circuit_breaker_result(&env);
+        let gate_addr: Option<Address> = env.storage().instance().get::<DataKey, Address>(&DataKey::DenylistGate);
+        let flag_addr: Option<Address> = env.storage().instance().get::<DataKey, Address>(&DataKey::JurisdictionFlag);
+        let allowlist_addr: Option<Address> =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::AllowlistToken);
 
-        if breaker.is_none()
-            && gate_addr.is_none()
-            && flag_addr.is_none()
-            && allowlist_addr.is_none()
-        {
+        if breaker.is_none() && gate_addr.is_none() && flag_addr.is_none() && allowlist_addr.is_none() {
             return Err(Error::NoChecksRegistered);
         }
 
         let mut results: Vec<bool> = Vec::new(&env);
 
         for address in addresses.iter() {
-            let mut all_passed = breaker.as_ref().map(|check| check.passed).unwrap_or(true);
+            let mut all_passed = breaker.as_ref().map_or(true, |result| result.passed);
 
+            if all_passed {
             if let Some(ref ga) = gate_addr {
                 let client = DenylistGateClient::new(&env, ga);
                 all_passed = all_passed && client.check(&address);
@@ -994,16 +942,17 @@ impl ComplianceAggregator {
 
             if let Some(ref fa) = flag_addr {
                 let client = JurisdictionFlagClient::new(&env, fa);
-                all_passed =
-                    all_passed && matches!(
+                    all_passed = all_passed
+                        && matches!(
                     client.try_is_permitted_jurisdiction(&address, &allowed_jurisdictions),
                     Ok(Ok(true))
                 );
             }
 
-            if let Some(ref aa) = allowlist_addr {
-                let client = AllowlistTokenClient::new(&env, aa);
-                all_passed = all_passed && client.is_allowed(&address);
+                if let Some(ref allowlist) = allowlist_addr {
+                    let client = AllowlistTokenClient::new(&env, allowlist);
+                    all_passed = all_passed && client.is_allowed(&address);
+                }
             }
 
             results.push_back(all_passed);
@@ -1018,11 +967,7 @@ impl ComplianceAggregator {
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
         if stored != *admin {
             return Err(Error::NotAuthorized);
         }

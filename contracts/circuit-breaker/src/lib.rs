@@ -14,11 +14,10 @@
 //!
 //! ## Who calls it
 //!
-//! - **The admin** calls `initialize` once, manages guardians, and calls
-//!   `unfreeze`. The admin or any configured guardian can call `freeze`;
-//!   guardians cannot resume operations. In production the admin should be a
-//!   `multisig-admin` contract address rather than a single key
-//!   (see `docs/emergency-freeze-design.md`).
+//! - **The admin** calls `initialize` once and manages guardians. The admin or
+//!   any guardian can `freeze`; only the admin can `unfreeze`. In production
+//!   the admin should be a `multisig-admin` contract address rather than a
+//!   single key (see `docs/emergency-freeze-design.md`).
 //! - **Admin transfer** is two-step: the current admin calls `propose_admin`,
 //!   and the proposed address calls `accept_admin`. The current admin keeps
 //!   control until the transfer is accepted, which avoids a mistyped address
@@ -26,8 +25,9 @@
 //! - **Consumer contracts** (token and transfer contracts, policy evaluators)
 //!   call `is_frozen()` before running their own checks. The call is
 //!   permissionless and requires no auth.
-//! - **Off-chain tooling and monitors** read `is_frozen()` and `metadata()`,
-//!   and follow the `Frozen` / `Unfrozen` events to alert on state changes.
+//! - **Off-chain tooling and monitors** read `is_frozen()`, `freeze_history()`
+//!   and `metadata()`, and follow the `Frozen` / `Unfrozen` events to alert on
+//!   state changes.
 //!
 //! ## How it composes with the other contracts
 //!
@@ -51,9 +51,10 @@
 //!
 //! ## Storage and TTL policy
 //!
-//! All state (admin, pending admin, guardians, freeze history, and the frozen flag) lives in **instance**
-//! storage, which shares a single TTL with the contract instance itself. Every
-//! write path (`initialize`, `freeze`, `unfreeze`, `propose_admin`,
+//! All state (admin, pending admin, guardians, freeze history and the frozen
+//! flag) lives in **instance** storage, which shares a single TTL with the
+//! contract instance itself. Every write path (`initialize`, `freeze`,
+//! `unfreeze`, `propose_admin`,
 //! `accept_admin`) finishes by extending that TTL: whenever the remaining TTL
 //! has dropped below [`INSTANCE_TTL_THRESHOLD`] (~7 days) it is bumped back up
 //! to [`INSTANCE_TTL_EXTEND_TO`] (~90 days). This keeps the breaker from being
@@ -77,8 +78,8 @@
 //! alongside it and call it after `upgrade`. See `STORAGE_VERSIONING.md`.
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address,
-    BytesN, Env, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, String,
+    Symbol, Vec,
 };
 
 /// Maximum number of guardians that may be configured. Bounds the cost of
@@ -96,6 +97,9 @@ pub const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO;
 /// Maximum number of freeze incidents retained by the contract.
 pub const MAX_FREEZE_HISTORY: u32 = 20;
 
+/// Maximum number of freeze incidents retained in instance storage.
+pub const MAX_FREEZE_HISTORY: u32 = 10;
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -105,14 +109,11 @@ enum DataKey {
     PendingAdmin,
     Guardians,
     AuditLog,
-    /// Ledger sequence until which a timed freeze (`freeze_for`) is active.
-    FrozenUntil,
-    /// Per-operation freeze flag set by `freeze_scope`.
-    FrozenScope(Symbol),
     FreezeHistory,
 }
 
-/// A freeze incident and its duration.
+/// One freeze incident. `until` is `None` while the breaker remains frozen
+/// and is filled with the unfreeze timestamp when the incident ends.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FreezeRecord {
@@ -254,95 +255,19 @@ impl CircuitBreaker {
         Ok(())
     }
 
-    /// Freeze the breaker. Callable by the admin or any configured guardian,
-    /// so an incident can be halted even when the admin key is unavailable.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // `breaker` is a `CircuitBreakerClient`; a guardian halts flows during an incident.
-    /// breaker.freeze(&guardian, &None);
-    /// assert!(breaker.is_frozen());
-    /// ```
-    ///
-    /// The optional reason is stored with the freeze history record.
+    /// Freeze the breaker. Callable by the admin or any configured guardian.
+    /// A reason is optional and is retained in the bounded incident history.
     pub fn freeze(env: Env, caller: Address, reason: Option<String>) -> Result<(), Error> {
         Self::require_admin_or_guardian(&env, &caller)?;
-        let currently_frozen: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Frozen)
-            .unwrap_or(false);
+        let currently_frozen: bool = env.storage().instance().get(&DataKey::Frozen).unwrap_or(false);
         if currently_frozen {
             return Ok(());
         }
-
-        let mut history: Vec<FreezeRecord> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FreezeHistory)
-            .unwrap_or_else(|| Vec::new(&env));
-        if history.len() >= MAX_FREEZE_HISTORY {
-            history.remove(0);
-        }
-        history.push_back(FreezeRecord {
-            by: caller.clone(),
-            at: env.ledger().timestamp(),
-            until: None,
-            reason,
-        });
-        env.storage()
-            .instance()
-            .set(&DataKey::FreezeHistory, &history);
         env.storage().instance().set(&DataKey::Frozen, &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::FrozenSince, &env.ledger().sequence());
+        Self::record_freeze(&env, caller.clone(), reason);
         Self::extend_instance_ttl(&env);
-        Frozen {
-            caller: caller.clone(),
-        }
-        .publish(&env);
+        Frozen { caller: caller.clone() }.publish(&env);
         Self::record_audit(&env, Symbol::new(&env, "freeze"), &caller, "circuit breaker frozen");
-        Ok(())
-    }
-
-    /// Freeze the breaker for `ledgers` ledgers. Callable by the admin or any
-    /// guardian. The freeze lifts automatically once the current ledger
-    /// sequence reaches `current + ledgers`, unless extended by another
-    /// `freeze_for` call or made permanent with `freeze`. A later
-    /// `freeze_for` never shortens an existing timed freeze.
-    pub fn freeze_for(env: Env, caller: Address, ledgers: u32) -> Result<u32, Error> {
-        Self::require_admin_or_guardian(&env, &caller)?;
-        let requested = env.ledger().sequence().saturating_add(ledgers);
-        let existing: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FrozenUntil)
-            .unwrap_or(0);
-        let until_ledger = requested.max(existing);
-        env.storage()
-            .instance()
-            .set(&DataKey::FrozenUntil, &until_ledger);
-        Self::extend_instance_ttl(&env);
-        TimedFrozen {
-            caller: caller.clone(),
-            until_ledger,
-        }
-        .publish(&env);
-        Ok(until_ledger)
-    }
-
-    /// Freeze a single operation `scope` (e.g. `mint`, `transfer`). Callable
-    /// by the admin or any guardian. Consumers check it with
-    /// `is_frozen_scope`; the global freeze still overrides every scope.
-    pub fn freeze_scope(env: Env, caller: Address, scope: Symbol) -> Result<(), Error> {
-        Self::require_admin_or_guardian(&env, &caller)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::FrozenScope(scope.clone()), &true);
-        Self::extend_instance_ttl(&env);
-        ScopeFrozen { caller, scope }.publish(&env);
         Ok(())
     }
 
@@ -380,13 +305,8 @@ impl CircuitBreaker {
         Self::require_admin(&env, &admin)?;
         // Idempotency: if already unfrozen, skip the write and event so that
         // duplicate calls from retrying scripts don't produce spurious events.
-        let currently_frozen: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Frozen)
-            .unwrap_or(false);
-        let timed_frozen = Self::timed_freeze_active(&env);
-        if !currently_frozen && !timed_frozen {
+        let currently_frozen: bool = env.storage().instance().get(&DataKey::Frozen).unwrap_or(false);
+        if !currently_frozen {
             return Ok(());
         }
         let mut history: Vec<FreezeRecord> = env
@@ -404,13 +324,9 @@ impl CircuitBreaker {
                 .set(&DataKey::FreezeHistory, &history);
         }
         env.storage().instance().set(&DataKey::Frozen, &false);
-        env.storage().instance().remove(&DataKey::FrozenSince);
-        env.storage().instance().remove(&DataKey::FrozenUntil);
+        Self::close_freeze_record(&env);
         Self::extend_instance_ttl(&env);
-        Unfrozen {
-            admin: admin.clone(),
-        }
-        .publish(&env);
+        Unfrozen { admin: admin.clone() }.publish(&env);
         Self::record_audit(&env, Symbol::new(&env, "unfreeze"), &admin, "circuit breaker unfrozen");
         Ok(())
     }
@@ -431,59 +347,13 @@ impl CircuitBreaker {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
-        let frozen: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Frozen)
-            .unwrap_or(false);
-        Ok(frozen || Self::timed_freeze_active(&env))
-    }
-
-    /// Returns the ledger sequence number when the breaker was frozen, or
-    /// `None` if the breaker is not currently frozen.
-    ///
-    /// Returns `Err(Error::NotInitialized)` if the contract has never been
-    /// initialized.
-    pub fn frozen_since(env: Env) -> Result<Option<u32>, Error> {
-        if !env.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::NotInitialized);
-        }
-        let currently_frozen: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Frozen)
-            .unwrap_or(false);
-        if !currently_frozen {
-            return Ok(None);
-        }
-        Ok(env
-            .storage()
-            .instance()
-            .get(&DataKey::FrozenSince))
-    }
-
-    /// Return the newest `limit` freeze records in chronological order.
-    pub fn freeze_history(env: Env, limit: u32) -> Vec<FreezeRecord> {
-        let history: Vec<FreezeRecord> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FreezeHistory)
-            .unwrap_or_else(|| Vec::new(&env));
-        let start = history.len().saturating_sub(limit);
-        let mut result = Vec::new(&env);
-        for index in start..history.len() {
-            result.push_back(history.get(index).unwrap());
-        }
-        result
+        Ok(env.storage().instance().get(&DataKey::Frozen).unwrap_or(false))
     }
 
     /// Returns the current admin address, or `Err(Error::NotInitialized)` if
     /// the contract has not yet been initialized.
     pub fn get_admin(env: Env) -> Result<Address, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+        env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
     }
 
     /// Add `guardian` to the freeze-only set. Admin-only. Adding an existing
@@ -533,9 +403,20 @@ impl CircuitBreaker {
         Self::contains(&Self::guardians(&env), &address)
     }
 
-    /// Returns every configured guardian, in insertion order.
-    pub fn list_guardians(env: Env) -> Vec<Address> {
-        Self::guardians(&env)
+    /// Return the most recent freeze records, ordered from oldest to newest.
+    /// At most `MAX_FREEZE_HISTORY` records are retained; `limit` selects the
+    /// newest records from that bounded history.
+    pub fn freeze_history(env: Env, limit: u32) -> Vec<FreezeRecord> {
+        let history: Vec<FreezeRecord> =
+            env.storage().instance().get(&DataKey::FreezeHistory).unwrap_or_else(|| Vec::new(&env));
+        let start = history.len().saturating_sub(limit);
+        let mut result = Vec::new(&env);
+        for index in start..history.len() {
+            if let Some(record) = history.get(index) {
+                result.push_back(record);
+            }
+        }
+        result
     }
 
     /// Propose a new admin. The current admin remains fully in control
@@ -544,11 +425,7 @@ impl CircuitBreaker {
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
-        AdminProposed {
-            current: admin,
-            proposed: new_admin,
-        }
-        .publish(&env);
+        AdminProposed { current: admin, proposed: new_admin }.publish(&env);
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -557,26 +434,15 @@ impl CircuitBreaker {
     /// admin itself.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         new_admin.require_auth();
-        let pending_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .ok_or(Error::NoPendingAdmin)?;
+        let pending_admin: Address =
+            env.storage().instance().get(&DataKey::PendingAdmin).ok_or(Error::NoPendingAdmin)?;
         if pending_admin != new_admin {
             return Err(Error::PendingAdminMismatch);
         }
-        let old_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
+        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
-        AdminTransferred {
-            new_admin: new_admin.clone(),
-            old_admin,
-        }
-        .publish(&env);
+        AdminTransferred { new_admin: new_admin.clone(), old_admin }.publish(&env);
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -589,11 +455,7 @@ impl CircuitBreaker {
     /// "Upgradeability" section for the full procedure.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        UpgradePerformed {
-            admin,
-            new_wasm_hash: new_wasm_hash.clone(),
-        }
-        .publish(&env);
+        UpgradePerformed { admin, new_wasm_hash: new_wasm_hash.clone() }.publish(&env);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -618,15 +480,8 @@ impl CircuitBreaker {
     /// Returns metadata about this contract instance, including version and
     /// admin address.
     pub fn metadata(env: Env) -> Result<Metadata, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        Ok(Metadata {
-            version: String::from_str(&env, env!("CARGO_PKG_VERSION")),
-            admin,
-        })
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        Ok(Metadata { version: String::from_str(&env, env!("CARGO_PKG_VERSION")), admin })
     }
 
     fn extend_instance_ttl(env: &Env) {
@@ -645,25 +500,38 @@ impl CircuitBreaker {
     }
 
     fn guardians(env: &Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Guardians)
-            .unwrap_or_else(|| Vec::new(env))
+        env.storage().instance().get(&DataKey::Guardians).unwrap_or_else(|| Vec::new(env))
     }
 
     fn contains(guardians: &Vec<Address>, address: &Address) -> bool {
         guardians.iter().any(|g| g == *address)
     }
 
+    fn record_freeze(env: &Env, by: Address, reason: Option<String>) {
+        let mut history: Vec<FreezeRecord> =
+            env.storage().instance().get(&DataKey::FreezeHistory).unwrap_or_else(|| Vec::new(env));
+        if history.len() >= MAX_FREEZE_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(FreezeRecord { by, at: env.ledger().timestamp(), until: None, reason });
+        env.storage().instance().set(&DataKey::FreezeHistory, &history);
+    }
+
+    fn close_freeze_record(env: &Env) {
+        let mut history: Vec<FreezeRecord> =
+            env.storage().instance().get(&DataKey::FreezeHistory).unwrap_or_else(|| Vec::new(env));
+        if let Some(mut latest) = history.pop_back() {
+            latest.until = Some(env.ledger().timestamp());
+            history.push_back(latest);
+            env.storage().instance().set(&DataKey::FreezeHistory, &history);
+        }
+    }
+
     /// Requires `caller`'s authorization and that it is either the admin or a
     /// configured guardian.
     fn require_admin_or_guardian(env: &Env, caller: &Address) -> Result<(), Error> {
         caller.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
         if stored_admin == *caller || Self::contains(&Self::guardians(env), caller) {
             return Ok(());
         }
@@ -672,11 +540,7 @@ impl CircuitBreaker {
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
         if stored_admin != *admin {
             return Err(Error::NotAuthorized);
         }
@@ -684,17 +548,11 @@ impl CircuitBreaker {
     }
 
     fn extend_instance_ttl(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
     }
 
     fn record_audit(env: &Env, kind: Symbol, subject: &Address, detail: &str) {
-        if let Some(audit_log) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::AuditLog)
-        {
+        if let Some(audit_log) = env.storage().instance().get::<DataKey, Address>(&DataKey::AuditLog) {
             AuditLogClient::new(env, &audit_log).record(
                 &env.current_contract_address(),
                 &kind,

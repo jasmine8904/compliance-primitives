@@ -1,23 +1,21 @@
 # compliance-aggregator
 
-The aggregator combines configured denylist, jurisdiction, and allowlist checks
-with AND semantics. The circuit breaker, when configured, runs first and
-short-circuits a frozen result.
+A composition point for evaluating multiple compliance primitives as one
+AND-composed decision.
 
 | Method | Purpose |
 | --- | --- |
-| `initialize(admin, denylist_gate, jurisdiction_flag, circuit_breaker)` | One-time setup; each check address is optional. |
-| `set_allowlist(admin, allowlist)` / `clear_allowlist(admin)` | Configure or remove the `allowlist-token` check. |
-| `check_address(address, allowed_jurisdictions)` | Return the overall boolean and per-check results. |
-| `check_address_verbose(address, allowed_jurisdictions)` | Return the existing results plus `Option<CheckFailure { source, code }>` for the first failure. |
-| `check_all(addresses, allowed_jurisdictions)` | Evaluate a batch while preserving the original per-address result shape. |
-| `check_all_verbose(addresses, allowed_jurisdictions)` | Include optional first-failure source and code Symbols for each address. |
-| `batch_check(addresses, allowed_jurisdictions)` | Bounded boolean-only batch API. |
-| `get_checks_summary()` | Return `(denylist_configured, jurisdiction_configured, allowlist_configured)`. |
+| `initialize(admin, denylist_gate, jurisdiction_flag, circuit_breaker)` | Configure the initial checks and administrator. |
+| `set_allowlist(admin, address)` / `clear_allowlist(admin)` | Register or unregister the `allowlist-token` check. |
+| `check_address(address, allowed_jurisdictions)` | Backwards-compatible overall boolean and per-check pass/fail results. |
+| `check_address_with_failures(address, allowed_jurisdictions)` | Return the overall boolean and a `Vec<CheckFailure>` with the source and code for each failed check. |
+| `check_all(addresses, allowed_jurisdictions)` | Backwards-compatible batch results with overall and per-check booleans. |
+| `check_all_with_failures(addresses, allowed_jurisdictions)` | Return one detailed per-address result, including structured failure reasons. |
+| `batch_check(addresses, allowed_jurisdictions)` | Return only the overall booleans. |
+| `get_checks_summary()` | Return `(denylist, jurisdiction, circuit_breaker, allowlist)` configured flags. |
+| `get_config()` | Inspect the configured check contract addresses. |
 
-`check_address` and `check_all` retain their existing return shapes. Use the
-verbose variants when callers need to explain a rejection; use
-`batch_check` when only pass/fail booleans are needed.
-
-Use the deployed contract's generated interface for exact enum and address
-encoding.
+`CheckFailure.source` identifies the check (`Denylist`, `Jurisdiction`,
+`CircuitBreaker`, or `Allowlist`). `CheckFailure.code` is a stable
+`CheckFailureCode`: `Denylisted`, `JurisdictionNotPermitted`,
+`CircuitBreakerFrozen`, or `NotAllowlisted`.
