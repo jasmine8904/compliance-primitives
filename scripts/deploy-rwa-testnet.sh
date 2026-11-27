@@ -2,8 +2,10 @@
 # Build and deploy the full RWA reference stack to Stellar testnet:
 #   allowlist-token, denylist-gate, jurisdiction-flag, rwa-token
 #
-# Prints a shell-friendly summary of all contract IDs. Redeploy after a
-# testnet reset by re-running this script and updating TESTNET.md.
+# Prints a shell-friendly summary of all contract IDs, records them in
+# testnet-ids.json under the current release, and refreshes the README
+# testnet IDs table via scripts/update-testnet-ids.mjs. Redeploy after a
+# testnet reset by re-running this script.
 #
 # Usage:
 #   STELLAR_SOURCE=<identity> ./scripts/deploy-rwa-testnet.sh
@@ -11,6 +13,8 @@
 # Optional:
 #   STELLAR_NETWORK=testnet   (default)
 #   ALLOWED_CODES='["US","CA"]'  — JSON array passed to rwa-token initialize
+#   RELEASE=<label>           — release key in testnet-ids.json
+#                               (default: package version from Cargo.toml)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +23,15 @@ cd "$REPO_ROOT"
 SOURCE_IDENTITY="${STELLAR_SOURCE:-default}"
 NETWORK="${STELLAR_NETWORK:-testnet}"
 ALLOWED_CODES="${ALLOWED_CODES:-[\"US\",\"CA\"]}"
+TESTNET_IDS_FILE="$REPO_ROOT/testnet-ids.json"
+
+if [ -z "${RELEASE:-}" ]; then
+  RELEASE="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$REPO_ROOT/Cargo.toml" | head -n 1)"
+fi
+if [ -z "$RELEASE" ]; then
+  echo "error: could not determine release; set RELEASE=<label>" >&2
+  exit 1
+fi
 
 need_wasm() {
   local path="$1"
@@ -103,11 +116,51 @@ stellar contract invoke \
   --jurisdiction "$JURISDICTION_ID" \
   --allowed_codes "$ALLOWED_CODES"
 
+echo "==> Recording contract IDs in testnet-ids.json (release: $RELEASE)..."
+RELEASE="$RELEASE" \
+NETWORK="$NETWORK" \
+ALLOWLIST_ID="$ALLOWLIST_ID" \
+GATE_ID="$GATE_ID" \
+JURISDICTION_ID="$JURISDICTION_ID" \
+RWA_ID="$RWA_ID" \
+TESTNET_IDS_FILE="$TESTNET_IDS_FILE" \
+node --input-type=module -e '
+import { readFileSync, writeFileSync } from "node:fs";
+
+const file = process.env.TESTNET_IDS_FILE;
+const release = process.env.RELEASE;
+
+let data = { releases: {} };
+try {
+  data = JSON.parse(readFileSync(file, "utf8"));
+} catch (err) {
+  if (err.code !== "ENOENT") throw err;
+}
+if (!data.releases) data.releases = {};
+
+data.releases[release] = {
+  network: process.env.NETWORK,
+  deployedAt: new Date().toISOString(),
+  contracts: {
+    "allowlist-token": process.env.ALLOWLIST_ID,
+    "denylist-gate": process.env.GATE_ID,
+    "jurisdiction-flag": process.env.JURISDICTION_ID,
+    "rwa-token": process.env.RWA_ID,
+  },
+};
+
+writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+'
+
+echo "==> Updating README testnet IDs table..."
+node "$REPO_ROOT/scripts/update-testnet-ids.mjs"
+
 cat <<EOF
 
 ============================================================
 RWA testnet reference deployment ($NETWORK)
 ============================================================
+Release:            $RELEASE
 Issuer / admin:     $ISSUER
 allowlist-token:    $ALLOWLIST_ID
 denylist-gate:      $GATE_ID
@@ -115,5 +168,5 @@ jurisdiction-flag:  $JURISDICTION_ID
 rwa-token:          $RWA_ID
 allowed_codes:      $ALLOWED_CODES
 ============================================================
-Copy these IDs into examples/rwa-token/TESTNET.md after deploy.
+Contract IDs recorded in testnet-ids.json and README updated.
 EOF

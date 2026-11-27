@@ -8,7 +8,12 @@ M-of-N administrative governance for protected contract actions.
 | `propose(action)` | Create a pending administrative proposal. |
 | `approve(signer, proposal_id)` | Approve a proposal as an authorized signer. |
 | `execute(proposal_id)` | Execute a proposal after the threshold is met. |
+| `get_pending_count()` | Return the number of proposals that are currently open (pending execution). Cheap read for wallet badges. |
 | `upgrade(new_wasm_hash)` | Move the contract to a new WASM hash. Requires the M-of-N threshold. |
+
+## Pending proposal count
+
+`get_pending_count()` returns a `u32` maintained by a counter in instance storage. It is incremented when `propose` creates a proposal and decremented when a proposal is executed. Because it is a stored counter, the read is O(1) and does not iterate over proposals.
 
 ## Upgrade path
 

@@ -36,6 +36,18 @@ fn setup_multisig(
 }
 
 // ---------------------------------------------------------------------------
+// get_pending_count tests
+// ---------------------------------------------------------------------------
+
+/// A freshly initialised multisig has no open proposals.
+#[test]
+fn test_get_pending_count_starts_at_zero() {
+    let env = Env::default();
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+    assert_eq!(client.get_pending_count(), 0u32);
+}
+
+// ---------------------------------------------------------------------------
 // Basic state tests
 // ---------------------------------------------------------------------------
 
@@ -433,7 +445,7 @@ fn test_propose_creates_proposal_with_zero_approvals() {
     let proposal_id = client.propose(&payload, &expiry);
 
     assert_eq!(proposal_id, 0u64);
-    let (stored_payload, stored_expiry, approvals) = client.get_proposal(&0);
+    let (stored_payload, stored_expiry, approvals, _) = client.get_proposal(&0);
     assert_eq!(stored_payload, payload);
     assert_eq!(stored_expiry, expiry);
     assert_eq!(approvals.len(), 0);
@@ -479,7 +491,7 @@ fn test_approve_same_signer_twice_returns_already_approved() {
     assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
 
     // Verify only 1 approval is stored.
-    let (_, _, approvals) = client.get_proposal(&proposal_id);
+    let (_, _, approvals, _) = client.get_proposal(&proposal_id);
     assert_eq!(approvals.len(), 1);
 }
 
@@ -592,22 +604,23 @@ fn test_propose_emits_proposal_created_event() {
 
     let payload_hash: BytesN<32> = env.crypto().sha256(&payload).to_bytes();
     let events = env.events().all();
-    let (id, topics, data) = events.last().unwrap();
-    assert_eq!(id, contract_id);
     assert_eq!(
-        topics,
-        (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env)
-    );
-    assert_eq!(
-        data,
-        Map::<Symbol, Val>::from_array(
+        events,
+        vec![
             &env,
-            [
-                (Symbol::new(&env, "expiry"), expiry.into_val(&env)),
-                (Symbol::new(&env, "payload_hash"), payload_hash.into_val(&env)),
-            ],
-        )
-        .into_val(&env)
+            (
+                contract_id.clone(),
+                (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env),
+                Map::<Symbol, Val>::from_array(
+                    &env,
+                    [
+                        (Symbol::new(&env, "expiry"), expiry.into_val(&env)),
+                        (Symbol::new(&env, "payload_hash"), payload_hash.into_val(&env)),
+                    ],
+                )
+                .into_val(&env),
+            ),
+        ]
     );
 }
 
@@ -621,29 +634,88 @@ fn test_approve_emits_proposal_approved_event_with_progress() {
     let payload = Bytes::from_array(&env, &[6u8; 32]);
     let expiry = env.ledger().sequence() + 100;
     let proposal_id = client.propose(&payload, &expiry);
+    let payload_hash: BytesN<32> = env.crypto().sha256(&payload).to_bytes();
 
     for (i, expected_approvals) in [(0u32, 1u32), (1, 2)] {
         let signer = signers.get(i).unwrap();
         client.approve(&proposal_id, &signer);
 
         let events = env.events().all();
-        let (id, topics, data) = events.last().unwrap();
-        assert_eq!(id, contract_id);
-        assert_eq!(
-            topics,
-            (Symbol::new(&env, "proposal_approved"), proposal_id, signer).into_val(&env)
-        );
-        assert_eq!(
-            data,
-            Map::<Symbol, Val>::from_array(
-                &env,
-                [(
-                    Symbol::new(&env, "approvals"),
-                    expected_approvals.into_val(&env),
-                )],
-            )
-            .into_val(&env)
-        );
+        if expected_approvals == 1 {
+            assert_eq!(
+                events,
+                vec![
+                    &env,
+                    (
+                        contract_id.clone(),
+                        (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env),
+                        Map::<Symbol, Val>::from_array(
+                            &env,
+                            [
+                                (Symbol::new(&env, "expiry"), expiry.into_val(&env)),
+                                (Symbol::new(&env, "payload_hash"), payload_hash.clone().into_val(&env)),
+                            ],
+                        )
+                        .into_val(&env),
+                    ),
+                    (
+                        contract_id.clone(),
+                        (Symbol::new(&env, "proposal_approved"), proposal_id, signer).into_val(&env),
+                        Map::<Symbol, Val>::from_array(
+                            &env,
+                            [(
+                                Symbol::new(&env, "approvals"),
+                                expected_approvals.into_val(&env),
+                            )],
+                        )
+                        .into_val(&env),
+                    ),
+                ]
+            );
+        } else {
+            assert_eq!(
+                events,
+                vec![
+                    &env,
+                    (
+                        contract_id.clone(),
+                        (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env),
+                        Map::<Symbol, Val>::from_array(
+                            &env,
+                            [
+                                (Symbol::new(&env, "expiry"), expiry.into_val(&env)),
+                                (Symbol::new(&env, "payload_hash"), payload_hash.clone().into_val(&env)),
+                            ],
+                        )
+                        .into_val(&env),
+                    ),
+                    (
+                        contract_id.clone(),
+                        (Symbol::new(&env, "proposal_approved"), proposal_id, signers.get(0).unwrap()).into_val(&env),
+                        Map::<Symbol, Val>::from_array(
+                            &env,
+                            [(
+                                Symbol::new(&env, "approvals"),
+                                1u32.into_val(&env),
+                            )],
+                        )
+                        .into_val(&env),
+                    ),
+                    (
+                        contract_id.clone(),
+                        (Symbol::new(&env, "proposal_approved"), proposal_id, signer).into_val(&env),
+                        Map::<Symbol, Val>::from_array(
+                            &env,
+                            [(
+                                Symbol::new(&env, "approvals"),
+                                expected_approvals.into_val(&env),
+                            )],
+                        )
+                        .into_val(&env),
+                    ),
+                ]
+            );
+        }
     }
 }
 
@@ -658,18 +730,12 @@ fn test_rejected_approve_emits_no_event() {
     let expiry = env.ledger().sequence() + 100;
     let proposal_id = client.propose(&payload, &expiry);
     let outsider = Address::generate(&env);
-    let events_before = env.events().all().len();
+    let events_before = env.events().all().events().len();
 
     let result = client.try_approve(&proposal_id, &outsider);
     assert_eq!(result, Err(Ok(Error::NotASigner)));
     let events = env.events().all();
-    assert!(events.len() <= events_before);
-    if let Some((_, topics, _)) = events.last() {
-        assert_eq!(
-            topics,
-            (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env)
-        );
-    }
+    assert!(events.events().len() <= events_before);
 }
 
 /// Approving an unknown proposal returns ProposalNotFound.
@@ -747,7 +813,7 @@ fn test_proposal_writes_refresh_ttl() {
 
     advance_past_threshold(&env);
     client.approve(&proposal_id, &signers.get(1).unwrap());
-    let (_payload, _expiry, approvals) = client.get_proposal(&proposal_id);
+    let (_payload, _expiry, approvals, _) = client.get_proposal(&proposal_id);
     assert_eq!(approvals.len(), 2);
 
     advance_past_threshold(&env);
@@ -839,7 +905,7 @@ fn test_upgrade_preserves_state_and_remains_callable() {
     assert_eq!(stored_signers.len(), 3);
     assert_eq!(stored_signers.get(2).unwrap(), extra_signer);
     assert_eq!(threshold, 2);
-    let (stored_payload, stored_expiry, approvals) = client.get_proposal(&proposal_id);
+    let (stored_payload, stored_expiry, approvals, _) = client.get_proposal(&proposal_id);
     assert_eq!(stored_payload, payload);
     assert_eq!(stored_expiry, expiry);
     assert_eq!(approvals.len(), 1);
@@ -958,6 +1024,192 @@ fn test_error_discriminants_not_reordered() {
     // New — appended after existing codes.
     assert_eq!(Error::NotASigner as u32, 12);
     assert_eq!(Error::AlreadyApproved as u32, 13);
+    assert_eq!(Error::NotApproved as u32, 14);
+    assert_eq!(Error::TimelockNotMet as u32, 15);
+    assert_eq!(Error::InvalidWeight as u32, 16);
+    assert_eq!(Error::WeightsMismatch as u32, 17);
+}
+
+// ---------------------------------------------------------------------------
+// #798 — Unapprove tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unapprove_revokes_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[10u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    let signer0 = signers.get(0).unwrap();
+    let signer1 = signers.get(1).unwrap();
+
+    let reached = client.approve(&proposal_id, &signer0);
+    assert!(!reached);
+
+    let reached2 = client.approve(&proposal_id, &signer1);
+    assert!(reached2);
+
+    // Revoke approval from signer1
+    let still_reached = client.unapprove(&signer1, &proposal_id);
+    assert!(!still_reached);
+
+    let (_, _, approvals) = client.get_proposal(&proposal_id);
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals.get(0).unwrap(), signer0);
+
+    // Execution should now fail because threshold 2 is not met
+    let exec_res = client.try_execute(&proposal_id);
+    assert_eq!(exec_res, Err(Ok(Error::ThresholdNotMet)));
+}
+
+#[test]
+fn test_unapprove_rejects_non_approved_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 2, 2);
+
+    let payload = Bytes::from_array(&env, &[11u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    let signer0 = signers.get(0).unwrap();
+    let res = client.try_unapprove(&signer0, &proposal_id);
+    assert_eq!(res, Err(Ok(Error::NotApproved)));
+}
+
+// ---------------------------------------------------------------------------
+// #799 — Cancel proposal tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cancel_proposal_by_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 2, 1);
+
+    let payload = Bytes::from_array(&env, &[12u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    let signer0 = signers.get(0).unwrap();
+    client.cancel(&signer0, &proposal_id);
+
+    let res = client.try_get_proposal(&proposal_id);
+    assert_eq!(res, Err(Ok(Error::ProposalNotFound)));
+}
+
+#[test]
+fn test_cancel_rejects_non_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_signers, _id, client) = setup_multisig(&env, 2, 1);
+
+    let payload = Bytes::from_array(&env, &[13u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    let outsider = Address::generate(&env);
+    let res = client.try_cancel(&outsider, &proposal_id);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+// ---------------------------------------------------------------------------
+// #800 — Timelock delay tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_execution_delay_timelock_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 2, 2);
+
+    // Set a 10 ledger execution delay
+    client.set_execution_delay(&10u32);
+    assert_eq!(client.get_execution_delay(), 10u32);
+
+    let payload = Bytes::from_array(&env, &[14u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    client.approve(&proposal_id, &signers.get(0).unwrap());
+    assert_eq!(client.get_proposal_eta(&proposal_id), 0);
+
+    // Second approval reaches threshold: ETA set to current ledger + 10
+    let current_ledger = env.ledger().sequence();
+    client.approve(&proposal_id, &signers.get(1).unwrap());
+    assert_eq!(client.get_proposal_eta(&proposal_id), current_ledger + 10);
+
+    // Attempting execution before ETA must fail with TimelockNotMet
+    let exec_early = client.try_execute(&proposal_id);
+    assert_eq!(exec_early, Err(Ok(Error::TimelockNotMet)));
+
+    // Advance ledger sequence past ETA
+    env.ledger().with_mut(|l| l.sequence_number += 10);
+
+    // Execution must now succeed
+    client.execute(&proposal_id);
+    assert_eq!(client.try_get_proposal(&proposal_id), Err(Ok(Error::ProposalNotFound)));
+}
+
+// ---------------------------------------------------------------------------
+// #801 — Weighted signers tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_initialize_with_weights_and_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MultisigAdmin, ());
+    let client = MultisigAdminClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let signers = vec![&env, alice.clone(), bob.clone()];
+    // Alice = weight 2 (e.g. CFO), Bob = weight 1. Threshold = 2.
+    let weights = vec![&env, 2u32, 1u32];
+
+    client.initialize_with_weights(&signers, &weights, &2u32);
+
+    assert_eq!(client.get_signer_weight(&alice), 2u32);
+    assert_eq!(client.get_signer_weight(&bob), 1u32);
+    assert_eq!(client.get_total_weight(), 3u32);
+
+    let payload = Bytes::from_array(&env, &[15u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    // Alice alone (weight 2 >= threshold 2) can reach threshold
+    let reached = client.approve(&proposal_id, &alice);
+    assert!(reached);
+
+    client.execute(&proposal_id);
+    assert_eq!(client.try_get_proposal(&proposal_id), Err(Ok(Error::ProposalNotFound)));
+}
+
+#[test]
+fn test_migration_and_set_signer_weight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, _id, client) = setup_multisig(&env, 2, 2);
+
+    let alice = signers.get(0).unwrap();
+    let bob = signers.get(1).unwrap();
+
+    // Default weights are 1
+    assert_eq!(client.get_signer_weight(&alice), 1u32);
+    assert_eq!(client.get_signer_weight(&bob), 1u32);
+
+    client.migrate_to_weighted();
+
+    // Update Alice's weight to 3
+    client.set_signer_weight(&alice, &3u32);
+    assert_eq!(client.get_signer_weight(&alice), 3u32);
+    assert_eq!(client.get_total_weight(), 4u32);
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,4 +1270,86 @@ fn test_execute_succeeds_when_removed_signer_did_not_approve() {
 
     let result = client.try_get_proposal(&proposal_id);
     assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
+}
+
+// ─── Issue #802: open proposal index ───────────────────────────────────────
+
+#[test]
+fn test_list_proposals_tracks_open_ids() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[1u8; 32]);
+    let first = client.propose(&payload, &100);
+    let second = client.propose(&payload, &100);
+    assert_eq!(first, 0);
+    assert_eq!(second, 1);
+
+    let ids = client.list_proposals(&0, &10);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get(0), Some(0));
+    assert_eq!(ids.get(1), Some(1));
+
+    let page = client.list_proposals(&1, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0), Some(1));
+}
+
+#[test]
+fn test_list_proposals_prunes_cancelled_and_executed() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[2u8; 32]);
+
+    let cancelled = client.propose(&payload, &100);
+    let executed = client.propose(&payload, &100);
+    let remaining = client.propose(&payload, &100);
+
+    client.cancel_proposal(&cancelled, &signers.get(0).unwrap());
+    assert!(!client.list_proposals(&0, &10).contains(cancelled));
+
+    client.approve(&executed, &signers.get(0).unwrap());
+    client.approve(&executed, &signers.get(1).unwrap());
+    client.execute(&executed);
+
+    let ids = client.list_proposals(&0, &10);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.get(0), Some(remaining));
+}
+
+#[test]
+fn test_list_proposals_prunes_expired() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[3u8; 32]);
+
+    let expired = client.propose(&payload, &20);
+    client.propose(&payload, &100);
+    env.ledger().set_sequence_number(21);
+
+    let ids = client.list_proposals(&0, &10);
+    assert_eq!(ids.len(), 1);
+    assert!(client.try_get_proposal(&expired).is_err());
+}
+
+// ─── Issue #803: proposal description hash ─────────────────────────────────
+
+#[test]
+fn test_proposal_description_hash_is_stored_and_exposed() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[4u8; 32]);
+    let description = BytesN::from_array(&env, &[9u8; 32]);
+
+    let with_description = client.propose_with_description(&payload, &100, &Some(description.clone()));
+    let (_, _, _, stored) = client.get_proposal(&with_description);
+    assert_eq!(stored, Some(description));
+
+    let without_description = client.propose(&payload, &100);
+    let (_, _, _, stored) = client.get_proposal(&without_description);
+    assert_eq!(stored, None);
 }

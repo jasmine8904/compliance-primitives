@@ -9,6 +9,15 @@ and each compliance rejection on testnet.
 
 ## Current reference addresses
 
+The canonical list of deployed testnet IDs lives in the repository root:
+
+- `README.md` — "Deployed testnet contract IDs" table (one row per release)
+- `testnet-ids.json` — machine-readable copy of the same data
+
+The deploy scripts write the freshly deployed IDs into both files
+automatically, so you normally do not need to copy them by hand. The table
+below is only a local scratchpad for the walkthrough in this document.
+
 | Contract / account | Testnet address |
 | --- | --- |
 | Issuer / admin | _fill after deploy_ |
@@ -20,7 +29,9 @@ and each compliance rejection on testnet.
 | Permitted jurisdictions | `["US","CA"]` |
 
 Testnet resets wipe contract state. After a reset (or when these IDs go stale),
-repeat the deployment steps below and replace the table values.
+repeat the deployment steps below; the deploy scripts refresh the root
+`README.md` table and `testnet-ids.json`, and you can copy the new values into
+the scratchpad above.
 
 ## Deploy the contracts
 
@@ -43,7 +54,9 @@ cargo build \
   --release
 ```
 
-Deploy each Wasm artifact and copy the resulting IDs into the address table:
+Deploy each Wasm artifact. The deploy scripts record the resulting IDs in the
+root `README.md` testnet table and `testnet-ids.json`; copy them into the
+scratchpad above for the walkthrough:
 
 ```sh
 stellar contract deploy \
@@ -163,7 +176,8 @@ stellar contract invoke --id "$JURISDICTION" --source "$ISSUER" --network "$NETW
 
 1. After a testnet reset (or when invokes fail because a contract is missing),
    rebuild and redeploy the three contracts.
-2. Update the address table with the newly deployed contract IDs and account
-   addresses.
+2. Confirm the deploy scripts updated the root `README.md` testnet table and
+   `testnet-ids.json` with the newly deployed contract IDs, then refresh the
+   scratchpad above with those IDs and the account addresses.
 3. Reinitialize each contract and repeat the walkthrough to confirm the
    documented calls still match the example.

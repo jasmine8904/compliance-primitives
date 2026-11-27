@@ -10,6 +10,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  migration-test:
+    name: previous-release WASM upgrade test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Upgrade previous release WASM to HEAD
+        run: bash scripts/test-migration.sh
+
   smoke-test:
     name: CLI smoke test (local network)
     runs-on: ubuntu-latest
@@ -122,6 +138,11 @@ jobs:
   wasm-size-budget:
     name: wasm size budget
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      WASM_SIZE_REPORT: ${{ runner.temp }}/wasm-size-report.md
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -137,6 +158,42 @@ jobs:
           cache-targets: "true"
       - name: Check wasm binary sizes against budget
         run: bash scripts/check-wasm-size.sh
+      # Runs even when the check fails so the table explains the failure.
+      # Skipped for fork PRs, whose GITHUB_TOKEN cannot write comments.
+      - name: Post wasm size table to PR
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.WASM_SIZE_REPORT;
+            if (!fs.existsSync(path)) return;
+            const body = fs.readFileSync(path, 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            // Update the previous table in place so each PR keeps one comment.
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes('<!-- wasm-size-budget -->'));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  cost-table:
+    name: cost table (BENCHMARKS.md)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12" # tomllib needs 3.11+
+      # Regenerate from budget-baselines.toml, then fail if the committed
+      # table is stale. Run the script locally to fix the diff.
+      - name: Regenerate cost table
+        run: python3 scripts/gen-cost-table.py
+      - name: Fail if BENCHMARKS.md cost table is stale
+        run: git diff --exit-code -- BENCHMARKS.md
 
   accessibility:
     name: accessibility audit (web/)
@@ -186,8 +243,28 @@ jobs:
             echo "✓ docs/interfaces is up to date"
           else
             echo "✗ docs/interfaces is out of date. Run ./scripts/regenerate-docs.sh and commit the changes."
-            git status --porcelain docs/interfaces/
-            git diff docs/interfaces/
+          git status --porcelain docs/interfaces/
+          git diff docs/interfaces/
+          exit 1
+          fi
+
+  docs-errors:
+    name: docs/ERRORS.md up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate error code docs
+        run: python3 scripts/generate-errors-docs.py
+      - name: Check for differences
+        run: |
+          # `git status --porcelain` also catches the file never having been
+          # committed (e.g. after a fresh clone).
+          if [ -z "$(git status --porcelain docs/ERRORS.md)" ]; then
+            echo "✓ docs/ERRORS.md is up to date"
+          else
+            echo "✗ docs/ERRORS.md is out of date. Run python3 scripts/generate-errors-docs.py and commit the changes."
+            git status --porcelain docs/ERRORS.md
+            git diff docs/ERRORS.md
             exit 1
           fi
 
@@ -216,8 +293,8 @@ jobs:
                   FAILED_CRATES+=("$CRATE_NAME")
                 fi
               else
-                echo "ERROR: Directory $dir exists but has no Cargo.toml"
-                exit 1
+                # Non-crate directories (e.g. js-client, README-only dirs) are skipped.
+                echo "Skipping $CRATE_NAME (no Cargo.toml)"
               fi
             fi
           done
@@ -255,6 +332,33 @@ jobs:
       - name: Check CHANGELOG.md and version are in sync
         run: ./scripts/check-changelog.sh
 
+  per-contract-changelog:
+    name: per-contract changelog check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history to build the changelog.
+          fetch-depth: 0
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+      - name: Regenerate per-contract changelog sections
+        run: ./scripts/generate-contract-changelogs.sh
+      - name: Check for differences
+        run: |
+          # `git status --porcelain` also catches untracked files (e.g. a new
+          # contract whose changelog section was generated but never committed).
+          if [ -z "$(git status --porcelain CHANGELOG.md)" ]; then
+            echo "✓ per-contract CHANGELOG sections are up to date"
+          else
+            echo "✗ CHANGELOG.md is out of date. Run ./scripts/generate-contract-changelogs.sh and commit the changes."
+            git status --porcelain CHANGELOG.md
+            git diff CHANGELOG.md
+            exit 1
+          fi
+
   contract-line-count:
     name: contract line-count guideline check
     runs-on: ubuntu-latest
@@ -268,11 +372,11 @@ jobs:
         run: bash scripts/check-contract-line-count.sh
 
   semver-checks:
-    name: cargo semver-checks
+    name: cargo semver-checks (compliance-pausable)
     runs-on: ubuntu-latest
-    # Check for accidental breaking API changes in public crates.
-    # Currently scopes to compliance-pausable (a publishable shared crate).
-    # Add --package flags for additional crates as they become public.
+    # Check for accidental breaking API changes in published crates against
+    # crates.io. Contract crates are publish = false and use the
+    # semver-checks-contracts job below instead.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

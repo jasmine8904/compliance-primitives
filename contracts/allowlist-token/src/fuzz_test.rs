@@ -28,6 +28,7 @@
 
 use super::*;
 use ed25519_dalek::SigningKey;
+use proptest::prelude::*;
 use soroban_sdk::testutils::ed25519::Sign;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{Address, BytesN, Env};
@@ -216,5 +217,179 @@ fn fuzz_delegated_tampered_signature_is_rejected_without_state_change() {
         let good = BytesN::from_array(&env, &sign(&env, &key, &target, nonce, expiry));
         client.add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &VALID_UNTIL, &good);
         assert!(client.is_allowed(&target));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property tests: random sequences of state transitions.
+// ---------------------------------------------------------------------------
+
+/// A single state-transition operation applied to the allowlist token.
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Add(u8),
+    Remove(u8),
+    Pause,
+    Unpause,
+    /// Attempt an admin-only mutation from a non-admin caller.
+    NonAdminAdd(u8),
+    NonAdminRemove(u8),
+    NonAdminPause,
+    NonAdminUnpause,
+}
+
+fn op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        4 => (0u8..8).prop_map(Op::Add),
+        4 => (0u8..8).prop_map(Op::Remove),
+        1 => Just(Op::Pause),
+        1 => Just(Op::Unpause),
+        1 => (0u8..8).prop_map(Op::NonAdminAdd),
+        1 => (0u8..8).prop_map(Op::NonAdminRemove),
+        1 => Just(Op::NonAdminPause),
+        1 => Just(Op::NonAdminUnpause),
+    ]
+}
+
+fn ops_strategy() -> impl Strategy<Value = Vec<Op>> {
+    prop::collection::vec(op_strategy(), 0..48)
+}
+
+/// Deterministic pool of addresses indexed by the `u8` carried in each `Op`.
+fn address_pool(env: &Env) -> [Address; 8] {
+    [
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        .. ProptestConfig::default()
+    })]
+
+    /// Random add/remove/pause/unpause/admin sequences must keep the tracked
+    /// allowlist count consistent with the set of allowed addresses, and pause
+    /// must block writes while admin-only paths reject non-admin callers.
+    #[test]
+    fn prop_allowlist_state_transitions(ops in ops_strategy()) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let contract_id = env.register(AllowlistToken, ());
+        let client = AllowlistTokenClient::new(&env, &contract_id);
+        client.initialize(&admin, &token);
+
+        let pool = address_pool(&env);
+        let mut expected: [bool; 8] = [false; 8];
+        let mut paused = false;
+
+        for op in ops {
+            match op {
+                Op::Add(i) => {
+                    let addr = &pool[i as usize];
+                    let result = client.try_add_to_allowlist(&admin, addr);
+                    if paused {
+                        prop_assert_eq!(result, Err(Ok(Error::ContractPaused)));
+                        prop_assert!(!client.is_allowed(addr));
+                    } else {
+                        prop_assert_eq!(result, Ok(Ok(())));
+                        expected[i as usize] = true;
+                        prop_assert!(client.is_allowed(addr));
+                    }
+                }
+                Op::Remove(i) => {
+                    let addr = &pool[i as usize];
+                    let result = client.try_remove_from_allowlist(&admin, addr);
+                    if paused {
+                        prop_assert_eq!(result, Err(Ok(Error::ContractPaused)));
+                    } else {
+                        prop_assert_eq!(result, Ok(Ok(())));
+                        expected[i as usize] = false;
+                        prop_assert!(!client.is_allowed(addr));
+                    }
+                }
+                Op::Pause => {
+                    let result = client.try_pause(&admin);
+                    prop_assert_eq!(result, Ok(Ok(())));
+                    paused = true;
+                }
+                Op::Unpause => {
+                    let result = client.try_unpause(&admin);
+                    prop_assert_eq!(result, Ok(Ok(())));
+                    paused = false;
+                }
+                Op::NonAdminAdd(i) => {
+                    let addr = &pool[i as usize];
+                    let intruder = Address::generate(&env);
+                    let result = client.try_add_to_allowlist(&intruder, addr);
+                    prop_assert!(result.is_err(), "non-admin add must be rejected");
+                    prop_assert_eq!(client.is_allowed(addr), expected[i as usize]);
+                }
+                Op::NonAdminRemove(i) => {
+                    let addr = &pool[i as usize];
+                    let intruder = Address::generate(&env);
+                    let result = client.try_remove_from_allowlist(&intruder, addr);
+                    prop_assert!(result.is_err(), "non-admin remove must be rejected");
+                    prop_assert_eq!(client.is_allowed(addr), expected[i as usize]);
+                }
+                Op::NonAdminPause => {
+                    let intruder = Address::generate(&env);
+                    let result = client.try_pause(&intruder);
+                    prop_assert!(result.is_err(), "non-admin pause must be rejected");
+                }
+                Op::NonAdminUnpause => {
+                    let intruder = Address::generate(&env);
+                    let result = client.try_unpause(&intruder);
+                    prop_assert!(result.is_err(), "non-admin unpause must be rejected");
+                }
+            }
+
+            // Count consistency: the number of allowed addresses in the pool
+            // always matches the tracked expectation.
+            let allowed = pool.iter().filter(|a| client.is_allowed(a)).count();
+            let expected_count = expected.iter().filter(|b| **b).count();
+            prop_assert_eq!(allowed, expected_count);
+        }
+    }
+
+    /// `add_to_allowlist` and `remove_from_allowlist` are idempotent: applying
+    /// the same operation twice yields the same state as applying it once.
+    #[test]
+    fn prop_add_remove_idempotent(ops in prop::collection::vec((any::<bool>(), 0u8..8), 0..32)) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let contract_id = env.register(AllowlistToken, ());
+        let client = AllowlistTokenClient::new(&env, &contract_id);
+        client.initialize(&admin, &token);
+
+        let pool = address_pool(&env);
+
+        for (is_add, i) in ops {
+            let addr = &pool[i as usize];
+            if is_add {
+                client.add_to_allowlist(&admin, addr);
+                let after_first = client.is_allowed(addr);
+                client.add_to_allowlist(&admin, addr);
+                prop_assert_eq!(client.is_allowed(addr), after_first);
+                prop_assert!(after_first);
+            } else {
+                client.remove_from_allowlist(&admin, addr);
+                let after_first = client.is_allowed(addr);
+                client.remove_from_allowlist(&admin, addr);
+                prop_assert_eq!(client.is_allowed(addr), after_first);
+                prop_assert!(!after_first);
+            }
+        }
     }
 }

@@ -481,7 +481,7 @@ mod code_validation {
         let env = Env::default();
         let (issuer, _contract_id, client) = setup(&env);
 
-        for raw in ["US", "GB", "CA", "DE", "ZZ", "AA"] {
+        for raw in ["US", "GB", "CA", "DE", "JP", "AD"] {
             let alice = Address::generate(&env);
             let code = String::from_str(&env, raw);
             client.set_jurisdiction(&issuer, &alice, &code);
@@ -1120,7 +1120,7 @@ fn test_add_jurisdiction_enforces_max_codes_per_address() {
 
     // Fill up to the cap with distinct two-letter codes.
     // There are 26 uppercase letters; generate MAX_CODES_PER_ADDRESS codes.
-    let all_codes = ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH"];
+    let all_codes = ["AD", "BB", "CC", "DE", "EE", "FR", "GG", "HK"];
     assert_eq!(all_codes.len() as u32, super::MAX_CODES_PER_ADDRESS);
 
     for code in all_codes.iter().take(super::MAX_CODES_PER_ADDRESS as usize - 1) {
@@ -1133,7 +1133,7 @@ fn test_add_jurisdiction_enforces_max_codes_per_address() {
         &String::from_str(&env, all_codes[super::MAX_CODES_PER_ADDRESS as usize - 1]),
     );
     // One more must be rejected.
-    let result = client.try_add_jurisdiction(&issuer, &alice, &String::from_str(&env, "ZZ"));
+    let result = client.try_add_jurisdiction(&issuer, &alice, &String::from_str(&env, "ZA"));
     assert_eq!(result, Err(Ok(Error::TooManyCodes)));
 }
 
@@ -1160,7 +1160,7 @@ fn test_add_jurisdiction_at_boundary_accepts_up_to_cap() {
     let (issuer, _contract_id, client) = setup(&env);
     let alice = Address::generate(&env);
 
-    let all_codes = ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH"];
+    let all_codes = ["AD", "BB", "CC", "DE", "EE", "FR", "GG", "HK"];
     for code in all_codes.iter().take(super::MAX_CODES_PER_ADDRESS as usize) {
         client.add_jurisdiction(&issuer, &alice, &String::from_str(&env, code));
     }
@@ -1188,4 +1188,341 @@ fn test_write_path_extends_instance_ttl() {
 
     client.set_jurisdiction(&issuer, &Address::generate(&env), &soroban_sdk::String::from_str(&env, "US"));
     assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+}
+
+#[test]
+fn test_set_and_revoke_compliance_officer_emit_events() {
+    use soroban_sdk::IntoVal;
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+
+    client.set_compliance_officer(&issuer, &officer);
+    let events = env.events().all();
+    let (_contract_id, topics, _data) = events.last().unwrap();
+    assert_eq!(
+        topics.get_unchecked(0),
+        soroban_sdk::Symbol::new(&env, "compliance_officer_set").into_val(&env)
+    );
+    assert_eq!(topics.get_unchecked(1), issuer.clone().into_val(&env));
+
+    client.revoke_compliance_officer(&issuer);
+    let events = env.events().all();
+    let (_contract_id, topics, _data) = events.last().unwrap();
+    assert_eq!(
+        topics.get_unchecked(0),
+        soroban_sdk::Symbol::new(&env, "compliance_officer_revoked").into_val(&env)
+    );
+    assert_eq!(topics.get_unchecked(1), issuer.clone().into_val(&env));
+
+    // Revoking when no officer is set must NOT emit another event.
+    let count = env.events().all().len();
+    client.revoke_compliance_officer(&issuer);
+    assert_eq!(env.events().all().len(), count);
+}
+
+// ---------------------------------------------------------------------------
+// #774 subdivisions, #775 ISO list, #776 batch-until, #777 cooldown
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rejects_unassigned_iso_codes() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    for raw in ["UK", "XX", "ZZ", "AA", "EU-NY"] {
+        let r = client.try_set_jurisdiction(&issuer, &alice, &String::from_str(&env, raw));
+        assert_eq!(r, Err(Ok(Error::InvalidJurisdictionCode)), "code {raw:?}");
+    }
+    for raw in ["GB", "ZW", "AD", "US"] {
+        client.set_jurisdiction(&issuer, &alice, &String::from_str(&env, raw));
+    }
+}
+
+#[test]
+fn test_set_jurisdiction_cost_within_baseline_with_iso_check() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &alice, &String::from_str(&env, "US"));
+    let allowed = vec![&env, String::from_str(&env, "US")];
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+    assert!(client.is_permitted_jurisdiction(&alice, &allowed));
+    let measured = (budget.cpu_instruction_cost(), budget.memory_bytes_cost());
+    let path = baseline_path_for_manifest_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let baseline = read_baseline(&path, "jurisdiction-flag.is_permitted_jurisdiction");
+    assert_budget_within_threshold(measured, baseline, "is_permitted_jurisdiction");
+}
+
+#[test]
+fn test_accepts_subdivision_codes() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    for raw in ["US-NY", "GB-ENG", "FR-75", "CA-B"] {
+        let a = Address::generate(&env);
+        let code = String::from_str(&env, raw);
+        client.set_jurisdiction(&issuer, &a, &code);
+        assert_eq!(client.get_jurisdiction(&a), Some(code));
+    }
+    let a = Address::generate(&env);
+    for raw in ["US-", "US-ABCD", "US_NY", "us-NY", "US-ny", "XX-NY", "USNY"] {
+        let r = client.try_set_jurisdiction(&issuer, &a, &String::from_str(&env, raw));
+        assert_eq!(r, Err(Ok(Error::InvalidJurisdictionCode)), "code {raw:?}");
+    }
+}
+
+#[test]
+fn test_permitted_country_implies_subdivisions_unless_disabled() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &alice, &String::from_str(&env, "US-NY"));
+
+    assert!(client.get_subdivision_inheritance());
+    let us = vec![&env, String::from_str(&env, "US")];
+    let ca = vec![&env, String::from_str(&env, "CA")];
+    let ny = vec![&env, String::from_str(&env, "US-NY")];
+    let ca_state = vec![&env, String::from_str(&env, "US-CA")];
+    assert!(client.is_permitted_jurisdiction(&alice, &us));
+    assert!(!client.is_permitted_jurisdiction(&alice, &ca));
+    assert!(client.is_permitted_jurisdiction(&alice, &ny));
+    assert!(!client.is_permitted_jurisdiction(&alice, &ca_state));
+
+    client.set_subdivision_inheritance(&issuer, &false);
+    assert!(!client.get_subdivision_inheritance());
+    assert!(!client.is_permitted_jurisdiction(&alice, &us));
+    assert!(client.is_permitted_jurisdiction(&alice, &ny));
+
+    // A country-level flag is never implied by a subdivision allow-entry.
+    let bob = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &bob, &String::from_str(&env, "US"));
+    client.set_subdivision_inheritance(&issuer, &true);
+    assert!(!client.is_permitted_jurisdiction(&bob, &ny));
+}
+
+#[test]
+fn test_set_multiple_jurisdictions_until() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(100);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let entries = vec![
+        &env,
+        (alice.clone(), String::from_str(&env, "US")),
+        (bob.clone(), String::from_str(&env, "CA")),
+    ];
+    client.set_multiple_jurisdictions_until(&issuer, &entries, &150);
+    assert_eq!(client.get_jurisdiction(&alice), Some(String::from_str(&env, "US")));
+    assert_eq!(client.get_jurisdiction(&bob), Some(String::from_str(&env, "CA")));
+
+    env.ledger().set_sequence_number(151);
+    assert_eq!(client.get_jurisdiction(&alice), None);
+    assert_eq!(client.get_jurisdiction(&bob), None);
+}
+
+#[test]
+fn test_set_multiple_jurisdictions_until_rejects_bad_input() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(100);
+    let alice = Address::generate(&env);
+
+    let empty: Vec<(Address, String)> = Vec::new(&env);
+    assert_eq!(
+        client.try_set_multiple_jurisdictions_until(&issuer, &empty, &200),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    let mut too_many = Vec::new(&env);
+    for _ in 0..=MAX_BATCH_SIZE {
+        too_many.push_back((Address::generate(&env), String::from_str(&env, "US")));
+    }
+    assert_eq!(
+        client.try_set_multiple_jurisdictions_until(&issuer, &too_many, &200),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    let one = vec![&env, (alice.clone(), String::from_str(&env, "US"))];
+    assert_eq!(
+        client.try_set_multiple_jurisdictions_until(&issuer, &one, &99),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    let bad = vec![
+        &env,
+        (alice.clone(), String::from_str(&env, "US")),
+        (Address::generate(&env), String::from_str(&env, "UK")),
+    ];
+    assert_eq!(
+        client.try_set_multiple_jurisdictions_until(&issuer, &bad, &200),
+        Err(Ok(Error::InvalidJurisdictionCode))
+    );
+    assert_eq!(client.get_jurisdiction(&alice), None);
+}
+
+#[test]
+fn test_cooldown_blocks_rapid_changes() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(100);
+    let alice = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let ca = String::from_str(&env, "CA");
+
+    assert_eq!(client.get_jurisdiction_cooldown(), 0);
+    client.set_jurisdiction_cooldown(&issuer, &10);
+    assert_eq!(client.get_jurisdiction_cooldown(), 10);
+
+    client.set_jurisdiction(&issuer, &alice, &us);
+    env.ledger().set_sequence_number(105);
+    assert_eq!(
+        client.try_set_jurisdiction(&issuer, &alice, &ca),
+        Err(Ok(Error::JurisdictionCooldownActive))
+    );
+    assert_eq!(
+        client.try_add_jurisdiction(&issuer, &alice, &ca),
+        Err(Ok(Error::JurisdictionCooldownActive))
+    );
+    assert_eq!(
+        client.try_set_jurisdiction_until(&issuer, &alice, &ca, &500),
+        Err(Ok(Error::JurisdictionCooldownActive))
+    );
+    let batch = vec![&env, (alice.clone(), ca.clone())];
+    assert_eq!(
+        client.try_set_multiple_jurisdictions(&issuer, &batch),
+        Err(Ok(Error::JurisdictionCooldownActive))
+    );
+    assert_eq!(
+        client.try_set_multiple_jurisdictions_until(&issuer, &batch, &500),
+        Err(Ok(Error::JurisdictionCooldownActive))
+    );
+
+    // Other addresses are unaffected.
+    client.set_jurisdiction(&issuer, &Address::generate(&env), &ca);
+
+    env.ledger().set_sequence_number(110);
+    client.set_jurisdiction(&issuer, &alice, &ca);
+    assert_eq!(client.get_jurisdiction(&alice), Some(ca));
+}
+
+#[test]
+fn test_cooldown_disabled_allows_rapid_changes() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.set_jurisdiction_cooldown(&issuer, &10);
+    client.set_jurisdiction_cooldown(&issuer, &0);
+    client.set_jurisdiction(&issuer, &alice, &String::from_str(&env, "US"));
+    client.set_jurisdiction(&issuer, &alice, &String::from_str(&env, "CA"));
+    assert_eq!(client.get_jurisdiction(&alice), Some(String::from_str(&env, "CA")));
+}
+
+#[test]
+fn test_set_jurisdiction_cooldown_is_issuer_only() {
+    let env = Env::default();
+    let (_issuer, _contract_id, client) = setup(&env);
+    let other = Address::generate(&env);
+    assert_eq!(
+        client.try_set_jurisdiction_cooldown(&other, &10),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_set_subdivision_inheritance(&other, &false),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+fn s(env: &Env, v: &str) -> String {
+    String::from_str(env, v)
+}
+
+#[test]
+fn group_name_expands_to_member_codes() {
+    let env = Env::default();
+    let (issuer, _, client) = setup(&env);
+    let user = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &user, &s(&env, "FR"));
+    client.set_group(&issuer, &s(&env, "EU"), &vec![&env, s(&env, "DE"), s(&env, "FR")]);
+    assert_eq!(client.get_group(&s(&env, "EU")).unwrap().len(), 2);
+    assert!(client.is_permitted_jurisdiction(&user, &vec![&env, s(&env, "EU")]));
+    assert!(!client.is_permitted_jurisdiction(&user, &vec![&env, s(&env, "EEA")]));
+    assert!(client.is_permitted_jurisdiction(&user, &vec![&env, s(&env, "US"), s(&env, "EU")]));
+}
+
+#[test]
+fn set_group_rejects_invalid_input() {
+    let env = Env::default();
+    let (issuer, _, client) = setup(&env);
+    assert_eq!(
+        client.try_set_group(&issuer, &s(&env, "EU"), &vec![&env]),
+        Err(Ok(Error::InvalidGroup))
+    );
+    assert_eq!(
+        client.try_set_group(&issuer, &s(&env, "EU"), &vec![&env, s(&env, "fr")]),
+        Err(Ok(Error::InvalidJurisdictionCode))
+    );
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_set_group(&stranger, &s(&env, "EU"), &vec![&env, s(&env, "FR")]),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn block_list_mode_inverts_permission() {
+    let env = Env::default();
+    let (issuer, _, client) = setup(&env);
+    let blocked = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let unknown = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &blocked, &s(&env, "KP"));
+    client.set_jurisdiction(&issuer, &allowed, &s(&env, "US"));
+    let list = vec![&env, s(&env, "KP"), s(&env, "IR")];
+
+    assert_eq!(client.get_mode(), JurisdictionMode::AllowList);
+    assert!(client.is_permitted_jurisdiction(&blocked, &list));
+    assert!(!client.is_permitted_jurisdiction(&allowed, &list));
+
+    client.set_mode(&issuer, &JurisdictionMode::BlockList);
+    assert_eq!(client.get_mode(), JurisdictionMode::BlockList);
+    assert!(!client.is_permitted_jurisdiction(&blocked, &list));
+    assert!(client.is_permitted_jurisdiction(&allowed, &list));
+    assert!(!client.is_permitted_jurisdiction(&unknown, &list));
+
+    client.set_group(&issuer, &s(&env, "SANCTIONED"), &list);
+    assert!(!client.is_permitted_jurisdiction(&blocked, &vec![&env, s(&env, "SANCTIONED")]));
+    assert!(client.is_permitted_jurisdiction(&allowed, &vec![&env, s(&env, "SANCTIONED")]));
+}
+
+#[test]
+fn test_get_jurisdiction_expiry_returns_set_expiry() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let user = Address::generate(&env);
+    let code = String::from_str(&env, "US");
+    env.ledger()
+        .with_mut(|ledger| ledger.sequence_number = 10);
+
+    // No flag at all: no expiry.
+    assert_eq!(client.get_jurisdiction_expiry(&user), None);
+
+    client.set_jurisdiction_until(&issuer, &user, &code, &500);
+    assert_eq!(client.get_jurisdiction_expiry(&user), Some(500));
+
+    // Clearing the flag clears the expiry with it.
+    client.set_jurisdiction(&issuer, &user, &code);
+    assert_eq!(client.get_jurisdiction_expiry(&user), None);
+}
+
+#[test]
+fn test_get_jurisdiction_expiry_returns_none_for_unexpiring_flag() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let user = Address::generate(&env);
+    let code = String::from_str(&env, "GB");
+
+    client.set_jurisdiction(&issuer, &user, &code);
+    assert_eq!(client.get_jurisdiction_expiry(&user), None);
 }

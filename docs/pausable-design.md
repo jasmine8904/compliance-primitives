@@ -103,11 +103,51 @@ where the audit `Blocked` event must survive.
 
 ## Auth model
 
-Each contract's pause/unpause methods run through the same `require_admin` /
-`require_issuer` helper that guards all other mutating operations. There is no
-separate "pauser" role. This is intentional: the set of principals that can
-modify list membership is the same set that can halt the contract entirely,
-keeping the permission model flat and auditable.
+Unpausing is gated by the same `require_admin` / `require_issuer` helper that
+guards all other mutating operations. Pausing is additionally allowed for an
+optional, separately-configured **pauser** address (see below), so that
+incident response does not require the (typically cold) admin key.
+
+### Pauser role
+
+`compliance-pausable` exports helpers for an optional pauser address:
+
+```rust
+pub fn get_pauser(env: &Env) -> Option<Address>
+pub fn set_pauser(env: &Env, pauser: &Address)
+pub fn clear_pauser(env: &Env)
+pub fn is_pauser(env: &Env, who: &Address) -> bool
+```
+
+- **Storage key**: the pauser address is stored under the fixed
+  `symbol_short!("Pauser")` key in the calling contract's *instance* storage,
+  alongside the `"Paused"` flag. It is absent by default; `get_pauser` returns
+  `None` until a contract sets one.
+- **Authorization rules**:
+  - `pause` is allowed for the admin/issuer **or** the configured pauser.
+  - `unpause` is **admin/issuer only**. The pauser can halt the contract but
+    cannot resume it — resuming is a deliberate, reviewed action.
+  - Setting or clearing the pauser is **admin/issuer only**.
+- **Events**: each contract keeps its own `#[contractevent]` structs. Contracts
+  that support the pauser role emit a distinct event (e.g. `PausedByPauser`)
+  when the pause is performed by the pauser rather than the admin, so audit
+  trails distinguish the two paths. `Unpaused` is always emitted with the
+  admin/issuer as the topic. `PauserChanged` is emitted on
+  `set_pauser`/`clear_pauser`.
+
+### Recommended key setup
+
+For incident response, separate the keys:
+
+- **Admin / issuer (cold key)**: held offline or in a multisig. Used for
+  unpausing, pauser rotation, and all other privileged mutations.
+- **Pauser (hot key)**: held by the on-call responder. It can only pause, so
+  compromise of the hot key cannot resume a halted contract or mutate list
+  membership. Rotate it after any suspected exposure via `set_pauser`.
+
+If a contract does not configure a pauser, the model degrades to the original
+admin-only behaviour: only the admin/issuer can pause or unpause.
+=======
 
 ## `#![no_std]` and wasm compatibility
 
@@ -265,6 +305,11 @@ Each contract's test module gains dedicated pausable tests covering:
 - mutations succeed again after unpausing
 - non-admin/non-issuer cannot pause or unpause
 - `pause` and `unpause` each emit the expected event
+- the configured pauser can pause but cannot unpause
+- the pauser cannot set or clear the pauser address
+- `set_pauser` / `clear_pauser` emit `PauserChanged`
+- a pause performed by the pauser emits the pauser-specific event
+=======
 
 `compliance-pausable` itself has unit tests that exercise all four helpers
 against a stub contract.

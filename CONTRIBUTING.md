@@ -35,6 +35,25 @@ For details on how issues are triaged, labeled, and prioritized, see
    XDR interface spec into `docs/interfaces/`.  Commit the updated files.
 6. **If you've bumped the workspace version in `Cargo.toml`**, add a corresponding entry to `CHANGELOG.md`. CI enforces this via `./scripts/check-changelog.sh`, which ensures every version bump is accompanied by a changelog entry.
 
+   `CHANGELOG.md` is organized **per contract**: each contract crate has its
+   own `## <contract-name>` heading (e.g. `## allowlist-token`,
+   `## policy-engine`), and entries go under the heading for the contract
+   they affect. If your change touches more than one contract, add an entry
+   under each affected heading. Changes that don't belong to a single
+   contract (workspace tooling, CI, docs) go under the `## Workspace`
+   heading.
+
+   The per-contract sections are generated with
+   [`git-cliff`](https://git-cliff.org/) from the commit history, scoped by
+   the paths each contract owns (see `cliff.toml`). During the release
+   process, maintainers run the changelog generation step, which
+   regenerates each contract's section from the commits that touched that
+   contract's crate. Contributors don't need to run `git-cliff`
+   themselves — writing a clear, conventional commit message (e.g.
+   `feat(allowlist-token): add get_admin view`) and adding a manual entry
+   under the right heading is enough; the generated section will pick up
+   the commit on the next release.
+
 7. **Before submitting a PR, run:**
    ```sh
    make test

@@ -25,9 +25,16 @@ name = "allowlist-token"
 version = "0.1.0"
 dependencies = [
  "compliance-pausable",
- "compliance-test-trace",
  "denylist-gate",
  "denylist-gate-consumer",
+ "ed25519-dalek",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "allowlist-token-usage"
+version = "0.1.0"
+dependencies = [
  "soroban-sdk",
 ]
 
@@ -195,6 +202,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "audit-log"
 version = "0.1.0"
 dependencies = [
+ "compliance-pausable",
  "soroban-sdk",
 ]
 
@@ -221,6 +229,12 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "block-buffer"
@@ -316,6 +330,58 @@ dependencies = [
 name = "circuit-breaker"
 version = "0.1.0"
 dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "circuit-breaker-consumer"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "circuit-breaker-policy-engine"
+version = "0.1.0"
+dependencies = [
+ "circuit-breaker",
+ "denylist-gate",
+ "policy-engine",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "compliance-aggregator"
+version = "0.1.0"
+dependencies = [
+ "circuit-breaker",
+ "compliance-check",
+ "compliance-pausable",
+ "denylist-gate",
+ "jurisdiction-flag",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "compliance-check"
+version = "0.1.0"
+dependencies = [
+ "allowlist-token",
+ "denylist-gate",
+ "jurisdiction-flag",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "compliance-integration-flow"
+version = "0.1.0"
+dependencies = [
+ "audit-log",
+ "circuit-breaker",
+ "compliance-aggregator",
+ "jurisdiction-flag",
+ "multisig-admin",
+ "policy-engine",
  "soroban-sdk",
 ]
 
@@ -584,6 +650,7 @@ dependencies = [
 name = "denylist-gate"
 version = "0.1.0"
 dependencies = [
+ "audit-log",
  "compliance-pausable",
  "soroban-sdk",
 ]
@@ -593,6 +660,14 @@ name = "denylist-gate-consumer"
 version = "0.1.0"
 dependencies = [
  "circuit-breaker",
+ "denylist-gate",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "denylist-gate-sep41"
+version = "0.1.0"
+dependencies = [
  "denylist-gate",
  "soroban-sdk",
 ]
@@ -767,7 +842,7 @@ checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1116,6 +1191,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jurisdiction-flag-consumer"
+version = "0.1.0"
+dependencies = [
+ "jurisdiction-flag",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "k256"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1201,6 +1284,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "multisig-governed-allowlist"
+version = "0.1.0"
+dependencies = [
+ "allowlist-token",
+ "multisig-admin",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1270,6 +1362,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pausable-consumer"
+version = "0.1.0"
+dependencies = [
+ "compliance-pausable",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1289,7 +1389,37 @@ dependencies = [
 name = "policy-engine"
 version = "0.1.0"
 dependencies = [
+ "circuit-breaker",
+ "compliance-pausable",
+ "denylist-gate",
+ "jurisdiction-flag",
  "soroban-sdk",
+]
+
+[[package]]
+name = "policy-engine-audit"
+version = "0.1.0"
+dependencies = [
+ "audit-log",
+ "denylist-gate",
+ "jurisdiction-flag",
+ "policy-engine",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
 ]
 
 [[package]]
@@ -1391,7 +1521,7 @@ checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1418,6 +1548,39 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rwa-compliance-flow"
+version = "0.1.0"
+dependencies = [
+ "allowlist-token",
+ "denylist-gate",
+ "jurisdiction-flag",
+ "policy-engine",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "rwa-token"
+version = "0.1.0"
+dependencies = [
+ "allowlist-token",
+ "circuit-breaker",
+ "denylist-gate",
+ "jurisdiction-flag",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "rwa-token-aggregator"
+version = "0.1.0"
+dependencies = [
+ "circuit-breaker",
+ "compliance-aggregator",
+ "denylist-gate",
+ "jurisdiction-flag",
+ "soroban-sdk",
+]
 
 [[package]]
 name = "schemars"
@@ -1500,7 +1663,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1583,7 +1746,7 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
- "digest",
+ "digest 0.10.7",
  "rand_core",
 ]
 
@@ -1884,6 +2047,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1920,7 +2094,7 @@ checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.4",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1969,6 +2143,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "tokenized-fund"
+version = "0.1.0"
+dependencies = [
+ "allowlist-token",
+ "circuit-breaker",
+ "jurisdiction-flag",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1994,7 +2178,7 @@ checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]

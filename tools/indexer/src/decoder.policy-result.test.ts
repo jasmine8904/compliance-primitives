@@ -75,6 +75,11 @@ function xdrMap(entries: [string, Uint8Array][]): Uint8Array {
   return concat(u32(17), u32(1), u32(entries.length), ...fields);
 }
 
+function xdrU32(value: number): Uint8Array {
+  // ScVal::U32 discriminant = 3, then the u32 value
+  return concat(u32(3), u32(value));
+}
+
 function toBase64(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64");
 }
@@ -97,6 +102,13 @@ const T1_FAIL = toBase64(xdrBool(false));
 const DATA = toBase64(xdrMap([
   ["from", xdrAccountAddress(KEY_FROM)],
   ["to", xdrAccountAddress(KEY_TO)],
+]));
+
+const POLICY_VERSION = 7;
+const DATA_WITH_VERSION = toBase64(xdrMap([
+  ["from", xdrAccountAddress(KEY_FROM)],
+  ["to", xdrAccountAddress(KEY_TO)],
+  ["policy_version", xdrU32(POLICY_VERSION)],
 ]));
 
 function makeRaw(
@@ -180,6 +192,48 @@ describe("decodeEvent — policy-engine PolicyResult", () => {
     });
   });
 
+  // ── Policy version ─────────────────────────────────────────────────────────
+  describe("PolicyResult policy_version", () => {
+    it("decodes policyVersion from the data map", () => {
+      const result = decodeEvent(makeRaw(T1_PASS, { value: DATA_WITH_VERSION }));
+      assert.ok(result !== null);
+      assert.equal(result.eventType, "PolicyResult");
+      assert.equal(result.policyVersion, POLICY_VERSION);
+    });
+
+    it("still decodes passed/from/to alongside policyVersion", () => {
+      const result = decodeEvent(makeRaw(T1_PASS, { value: DATA_WITH_VERSION }));
+      assert.ok(result !== null);
+      assert.equal(result.policyPassed, true);
+      assert.ok(result.policyFrom !== null, "policyFrom should not be null");
+      assert.match(result.policyFrom!, /^G/, "policyFrom should start with G");
+      assert.ok(result.policyTo !== null, "policyTo should not be null");
+      assert.match(result.policyTo!, /^G/, "policyTo should start with G");
+      assert.notEqual(result.policyFrom, result.policyTo, "from and to should differ");
+    });
+
+    it("decodes policyVersion on a failing evaluation", () => {
+      const result = decodeEvent(makeRaw(T1_FAIL, { value: DATA_WITH_VERSION }));
+      assert.ok(result !== null);
+      assert.equal(result.policyPassed, false);
+      assert.equal(result.policyVersion, POLICY_VERSION);
+    });
+
+    it("sets policyVersion to null for legacy events without the field", () => {
+      const result = decodeEvent(makeRaw(T1_PASS));
+      assert.ok(result !== null);
+      assert.equal(result.eventType, "PolicyResult");
+      assert.equal(result.policyVersion, null);
+    });
+
+    it("sets policyVersion to null when data is missing", () => {
+      const emptyData = toBase64(concat(u32(1))); // ScVal::Void
+      const result = decodeEvent(makeRaw(T1_PASS, { value: emptyData }));
+      assert.ok(result !== null);
+      assert.equal(result.policyVersion, null);
+    });
+  });
+
   // ── Failing evaluation ─────────────────────────────────────────────────────
   describe("PolicyResult passed=false", () => {
     it("decodes policyPassed as false", () => {
@@ -252,6 +306,7 @@ describe("decodeEvent — policy-engine PolicyResult", () => {
       assert.equal(result.policyFrom, null);
       assert.equal(result.policyTo, null);
       assert.equal(result.policyPassed, null);
+      assert.equal(result.policyVersion, null);
     });
   });
 });

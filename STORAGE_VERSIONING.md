@@ -165,3 +165,6 @@ entrypoint:
    a breaking storage-layout change is `complexity: high` regardless of how
    small the code diff looks — it changes a compatibility commitment to
    every live deployment of that contract.
+4. For any upgrade that touches storage, work through the
+   [Upgrade Safety Checklist](./docs/upgrade-safety-checklist.md): storage key
+   changes, schema version bump, migration function, and testnet rehearsal.

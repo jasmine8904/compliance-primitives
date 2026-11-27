@@ -17,6 +17,7 @@ This repo has two fuzzing layers:
 | `denylist_gate_sequences`                      | `contracts/denylist-gate/src/fuzz_test.rs` (`fuzz_denylist_sequences`) |
 | `jurisdiction_set_get_sequences`               | `contracts/jurisdiction-flag/src/fuzz.rs` (`fuzz_jurisdiction_set_get_sequences`) |
 | `jurisdiction_multicode_add_remove_sequences`  | `contracts/jurisdiction-flag/src/fuzz.rs` (`fuzz_jurisdiction_multicode_add_remove_sequences`) |
+| `circuit_breaker_guardian_sequences`           | `contracts/circuit-breaker/src/fuzz.rs` (`fuzz_circuit_breaker_guardian_sequences`) |
 
 Setup (once):
 
@@ -31,6 +32,7 @@ Run a target (from the repo root):
 cargo +nightly fuzz run denylist_gate_sequences -- -runs=1000
 cargo +nightly fuzz run jurisdiction_set_get_sequences -- -runs=1000
 cargo +nightly fuzz run jurisdiction_multicode_add_remove_sequences -- -runs=1000
+cargo +nightly fuzz run circuit_breaker_guardian_sequences -- -runs=1000
 ```
 
 Run until stopped (no `-runs` limit) or add `-max_total_time=300` for a
@@ -50,6 +52,9 @@ each chunk is one contract operation. Chunks beyond the per-target op cap
   `b1 % 7` = code index. Calls `set_jurisdiction` only.
 - `jurisdiction_multicode_add_remove_sequences`: 2 bytes per op. `b0 % 7` =
   code index, low bit of `b1` = add (0) / remove (1).
+- `circuit_breaker_guardian_sequences`: 3 bytes per op. `b0 % 4` = add /
+  remove / freeze / unfreeze, `b1 % 5` = guardian index, `b2 % 3` = caller
+  index (admin or one of the guardian slots).
 
 ### Extending a target
 
@@ -105,6 +110,42 @@ expiry semantics are implemented, add checks for `valid_until` equal to zero,
 the current ledger sequence, values near `u32::MAX`, and randomized values;
 assert that only the documented `Error` results are returned for invalid
 boundaries. See #397 for the requested follow-up.
+
+## circuit-breaker (`#817`)
+
+Harness: `contracts/circuit-breaker/src/fuzz.rs`
+
+Each iteration applies a random sequence of `add_guardian`,
+`remove_guardian`, `freeze`, and `unfreeze` calls, each issued by a random
+caller drawn from the admin and the guardian pool.
+
+Invariants checked after every step:
+
+1. **No duplicate guardians** — the guardian list returned by
+   `get_guardians` never contains the same address twice, regardless of how
+   many `add_guardian` calls target it.
+2. **Only guardians/admin freeze** — `freeze` / `unfreeze` succeed only when
+   the caller is the admin or a current guardian; any other caller gets an
+   authorization error and the frozen state is unchanged.
+
+### Short run (default, also in `cargo test`)
+
+```sh
+cargo test -p circuit-breaker fuzz_circuit_breaker_guardian_sequences -- --nocapture
+```
+
+Defaults: `FUZZ_ITERATIONS=128`, `FUZZ_OPS=24`.
+
+### Periodic longer campaign (not in CI)
+
+```sh
+FUZZ_ITERATIONS=2000 FUZZ_OPS=64 \
+  cargo test -p circuit-breaker fuzz_circuit_breaker_guardian_sequences -- --nocapture
+```
+
+Run this after non-trivial changes to `add_guardian` / `remove_guardian` /
+`freeze` / `unfreeze`, or as part of a release checklist. Failures print the
+failing `seed` so the sequence is reproducible.
 
 ## policy-engine (`#234`)
 

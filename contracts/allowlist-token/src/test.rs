@@ -2,7 +2,7 @@ use super::*;
 use ed25519_dalek::SigningKey;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::testutils::ed25519::Sign;
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, vec, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec};
 use std::path::{Path, PathBuf};
 
 // ─── MockToken ───────────────────────────────────────────────────────────────
@@ -12,10 +12,40 @@ use std::path::{Path, PathBuf};
 #[contract]
 struct MockToken;
 
+#[contracttype]
+enum MockKey {
+    Balance(Address),
+}
+
 #[contractimpl]
 impl MockToken {
+    /// Test-only: credits `amount` to `to` without any auth check.
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let current = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .instance()
+            .set(&MockKey::Balance(to), &(current + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&MockKey::Balance(id))
+            .unwrap_or(0)
+    }
+
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
+        if from != to {
+            let from_balance = Self::balance(env.clone(), from.clone());
+            let to_balance = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .instance()
+                .set(&MockKey::Balance(from.clone()), &(from_balance - amount));
+            env.storage()
+                .instance()
+                .set(&MockKey::Balance(to.clone()), &(to_balance + amount));
+        }
         env.storage().instance().set(&Symbol::new(&env, "last"), &(from, to, amount));
     }
 
@@ -24,6 +54,10 @@ impl MockToken {
     }
 
     pub fn clawback(env: Env, from: Address, amount: i128) {
+        let from_balance = Self::balance(env.clone(), from.clone());
+        env.storage()
+            .instance()
+            .set(&MockKey::Balance(from.clone()), &(from_balance - amount));
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "clawback"), &(from, amount));
@@ -31,6 +65,71 @@ impl MockToken {
 
     pub fn last_clawback(env: Env) -> Option<(Address, i128)> {
         env.storage().instance().get(&Symbol::new(&env, "clawback"))
+    }
+
+    // ── SEP-41 surface used by the conformance suite ─────────────────────────
+
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&allowance_key(&env, &from, &spender))
+            .unwrap_or(0)
+    }
+
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        from.require_auth();
+        env.storage().instance().set(
+            &allowance_key(&env, &from, &spender),
+            &AllowanceData {
+                amount,
+                expiration_ledger,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("approve"), from.clone(), spender.clone()),
+            (amount, expiration_ledger),
+        );
+    }
+
+
+    pub fn set_balance(env: Env, id: Address, amount: i128) {
+        env.storage().instance().set(&MockKey::Balance(id), &amount);
+    }
+
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "last"), &(from.clone(), to.clone(), amount));
+        env.events().publish(
+            (symbol_short!("transfer"), from, to),
+            amount,
+        );
+    }
+
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn name(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "Mock Token")
+    }
+
+    pub fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "MOCK")
+    }
+
+    pub fn total_supply(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "supply"))
+            .unwrap_or(0)
+    }
+
+    pub fn set_total_supply(env: Env, amount: i128) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "supply"), &amount);
     }
 }
 
@@ -356,7 +455,7 @@ fn test_transfer_blocked_when_recipient_not_allowlisted() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_add"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
             (
                 contract_id.clone(),
@@ -530,7 +629,7 @@ fn test_remove_from_allowlist_never_added_is_noop() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_remove"), never_added.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -599,7 +698,7 @@ fn test_add_to_allowlist_emits_allow_add_event() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_add"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -621,12 +720,12 @@ fn test_remove_from_allowlist_emits_allow_remove_event() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_add"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_remove"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -1591,4 +1690,954 @@ fn test_delegated_valid_until_ledger_is_bound_by_signature() {
     );
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_allowlist_count_tracks_only_real_state_changes() {
+    let env = Env::default();
+    let (admin, _token, _id, client) = setup(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    assert_eq!(client.allowlist_count(), 0);
+
+    client.add_to_allowlist(&admin, &a, &None);
+    assert_eq!(client.allowlist_count(), 1);
+
+    // Re-adding an existing address only changes its expiration.
+    client.add_to_allowlist(&admin, &a, &Some(env.ledger().sequence() + 100));
+    assert_eq!(client.allowlist_count(), 1);
+
+    client.add_multiple_to_allowlist(&admin, &vec![&env, a.clone(), b.clone()], &None);
+    assert_eq!(client.allowlist_count(), 2);
+
+    client.remove_from_allowlist(&admin, &b);
+    assert_eq!(client.allowlist_count(), 1);
+
+    // Removing an address that is not listed is a no-op.
+    client.remove_from_allowlist(&admin, &b);
+    assert_eq!(client.allowlist_count(), 1);
+
+    client.remove_multiple_from_allowlist(&admin, &vec![&env, a.clone(), b.clone()]);
+    assert_eq!(client.allowlist_count(), 0);
+}
+
+#[test]
+fn test_is_allowed_batch_returns_results_in_input_order() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let listed = Address::generate(&env);
+    let unlisted = Address::generate(&env);
+    client.add_to_allowlist(&admin, &listed, &None);
+
+    let addresses = vec![&env, unlisted.clone(), listed.clone(), unlisted.clone()];
+    assert_eq!(
+        client.is_allowed_batch(&addresses),
+        vec![&env, false, true, false]
+    );
+    assert_eq!(client.is_allowed_batch(&Vec::new(&env)), Vec::new(&env));
+}
+
+#[test]
+fn test_is_allowed_batch_rejects_batches_over_limit() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    let mut addresses = Vec::new(&env);
+    for _ in 0..=MAX_BATCH_SIZE {
+        addresses.push_back(Address::generate(&env));
+    }
+
+    assert_eq!(
+        client.try_is_allowed_batch(&addresses),
+        Err(Ok(Error::BatchTooLarge))
+    );
+}
+
+// ─── Merkle allowlist helpers ────────────────────────────────────────────────
+
+/// Mirrors the leaf encoding documented in `docs/allowlist-merkle-root.md`.
+fn merkle_leaf(env: &Env, address: &Address) -> BytesN<32> {
+    let address_str = address.to_string().to_string();
+    let mut preimage = Bytes::from_slice(env, &[0x00]);
+    preimage.append(&Bytes::from_slice(env, address_str.as_bytes()));
+    env.crypto().sha256(&preimage).to_bytes()
+}
+
+/// Mirrors the sorted-pair node encoding documented in `docs/allowlist-merkle-root.md`.
+fn merkle_node(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
+    let (lo, hi) = if a.to_array() <= b.to_array() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut preimage = Bytes::from_slice(env, &[0x01]);
+    preimage.append(&Bytes::from_slice(env, &lo.to_array()));
+    preimage.append(&Bytes::from_slice(env, &hi.to_array()));
+    env.crypto().sha256(&preimage).to_bytes()
+}
+
+/// Builds a four-holder tree and returns its root, the holders, and each
+/// holder's two-level proof.
+fn build_four_leaf_tree(
+    env: &Env,
+) -> (BytesN<32>, [Address; 4], [Vec<BytesN<32>>; 4]) {
+    let holders = [
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ];
+    let l0 = merkle_leaf(env, &holders[0]);
+    let l1 = merkle_leaf(env, &holders[1]);
+    let l2 = merkle_leaf(env, &holders[2]);
+    let l3 = merkle_leaf(env, &holders[3]);
+    let n01 = merkle_node(env, &l0, &l1);
+    let n23 = merkle_node(env, &l2, &l3);
+    let root = merkle_node(env, &n01, &n23);
+    let proofs = [
+        vec![env, l1.clone(), n23.clone()],
+        vec![env, l0.clone(), n23.clone()],
+        vec![env, l3.clone(), n01.clone()],
+        vec![env, l2.clone(), n01.clone()],
+    ];
+    (root, holders, proofs)
+}
+
+#[test]
+fn test_max_balance_limits_recipient_balance() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let token = MockTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.add_multiple_to_allowlist(&admin, &vec![&env, sender.clone(), receiver.clone()], &None);
+    token.mint(&sender, &500);
+    token.mint(&receiver, &80);
+
+    client.set_global_max_balance(&admin, &Some(100));
+    assert_eq!(client.get_global_max_balance(), Some(100));
+
+    // 80 + 20 = 100 is at the limit, so it is allowed.
+    assert!(client.transfer(&sender, &receiver, &20));
+
+    // 100 + 1 exceeds the limit.
+    assert_eq!(
+        client.try_transfer(&sender, &receiver, &1),
+        Err(Ok(Error::MaxBalanceExceeded))
+    );
+    assert_eq!(token.balance(&receiver), 100);
+}
+
+#[test]
+fn test_per_address_max_balance_is_stricter_when_both_apply() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let token = MockTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.add_multiple_to_allowlist(&admin, &vec![&env, sender.clone(), receiver.clone()], &None);
+    token.mint(&sender, &500);
+
+    client.set_global_max_balance(&admin, &Some(100));
+    client.set_address_max_balance(&admin, &receiver, &Some(50));
+    assert_eq!(client.get_address_max_balance(&receiver), Some(50));
+
+    // The per-address limit (50) is stricter than the global one (100).
+    assert_eq!(
+        client.try_transfer(&sender, &receiver, &51),
+        Err(Ok(Error::MaxBalanceExceeded))
+    );
+    assert!(client.transfer(&sender, &receiver, &50));
+
+    // Clearing the per-address limit leaves only the global limit.
+    client.set_address_max_balance(&admin, &receiver, &None);
+    assert_eq!(client.get_address_max_balance(&receiver), None);
+    assert!(client.transfer(&sender, &receiver, &50));
+    assert_eq!(token.balance(&receiver), 100);
+}
+
+#[test]
+fn test_max_balance_setters_are_admin_only_and_reject_negative_limits() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let attacker = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    assert_eq!(
+        client.try_set_global_max_balance(&attacker, &Some(10)),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_set_address_max_balance(&attacker, &holder, &Some(10)),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_set_global_max_balance(&admin, &Some(-1)),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        client.try_set_address_max_balance(&admin, &holder, &Some(-1)),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn test_merkle_proof_rejected_before_root_is_set() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    let (_root, holders, proofs) = build_four_leaf_tree(&env);
+
+    assert_eq!(client.get_allowlist_root(), None);
+    assert!(!client.is_allowed_with_proof(&holders[0], &proofs[0]));
+}
+
+#[test]
+fn test_merkle_proof_accepts_members_and_rejects_others() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let (root, holders, proofs) = build_four_leaf_tree(&env);
+    client.set_allowlist_root(&admin, &root);
+    assert_eq!(client.get_allowlist_root(), Some(root.clone()));
+
+    for i in 0..4 {
+        assert!(client.is_allowed_with_proof(&holders[i], &proofs[i]));
+    }
+
+    // A valid proof for one holder does not verify another holder.
+    assert!(!client.is_allowed_with_proof(&holders[0], &proofs[1]));
+
+    // An outsider cannot reuse a member's proof.
+    let outsider = Address::generate(&env);
+    assert!(!client.is_allowed_with_proof(&outsider, &proofs[0]));
+
+    // Proofs longer than the cap are rejected without hashing.
+    let mut too_long = Vec::new(&env);
+    for _ in 0..=MAX_MERKLE_PROOF_LEN {
+        too_long.push_back(BytesN::from_array(&env, &[0u8; 32]));
+    }
+    assert!(!client.is_allowed_with_proof(&holders[0], &too_long));
+}
+
+#[test]
+fn test_set_allowlist_root_is_admin_only_and_blocked_while_paused() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let (root, _holders, _proofs) = build_four_leaf_tree(&env);
+    let attacker = Address::generate(&env);
+
+    assert_eq!(
+        client.try_set_allowlist_root(&attacker, &root),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    client.pause(&admin);
+    assert_eq!(
+        client.try_set_allowlist_root(&admin, &root),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_transfer_with_proof_forwards_only_when_both_proofs_verify() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let (root, holders, proofs) = build_four_leaf_tree(&env);
+    client.set_allowlist_root(&admin, &root);
+    let token = MockTokenClient::new(&env, &token_id);
+
+    // Both parties prove membership: the transfer is forwarded.
+    assert!(client.transfer_with_proof(
+        &holders[0],
+        &holders[2],
+        &50,
+        &proofs[0],
+        &proofs[2],
+    ));
+    assert_eq!(
+        token.last_transfer(),
+        Some((holders[0].clone(), holders[2].clone(), 50))
+    );
+
+    // Recipient proof is missing: the transfer is blocked and nothing is forwarded.
+    let outsider = Address::generate(&env);
+    assert!(!client.transfer_with_proof(
+        &holders[0],
+        &outsider,
+        &60,
+        &proofs[0],
+        &proofs[0],
+    ));
+    assert_eq!(
+        token.last_transfer(),
+        Some((holders[0].clone(), holders[2].clone(), 50))
+    );
+}
+
+#[test]
+fn test_transfer_with_proof_respects_freeze_and_pause() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let (root, holders, proofs) = build_four_leaf_tree(&env);
+    client.set_allowlist_root(&admin, &root);
+
+    client.freeze(&admin, &holders[1]);
+    assert_eq!(
+        client.try_transfer_with_proof(
+            &holders[0],
+            &holders[1],
+            &10,
+            &proofs[0],
+            &proofs[1],
+        ),
+        Err(Ok(Error::AddressFrozen))
+    );
+    client.unfreeze(&admin, &holders[1]);
+
+    client.pause(&admin);
+    assert_eq!(
+        client.try_transfer_with_proof(
+            &holders[0],
+            &holders[1],
+            &10,
+            &proofs[0],
+            &proofs[1],
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_holder_count_follows_zero_nonzero_transitions() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
+    MockTokenClient::new(&env, &token_id).mint(&alice, &1000);
+
+    assert_eq!(client.holder_count(), 0);
+
+    // alice drains to zero, bob goes 0 -> non-zero: still one holder.
+    client.transfer(&alice, &bob, &1000);
+    assert_eq!(client.holder_count(), 1);
+
+    // alice 0 -> 400: second holder.
+    client.transfer(&bob, &alice, &400);
+    assert_eq!(client.holder_count(), 2);
+
+    // bob drains to zero: back to one holder.
+    client.transfer(&bob, &alice, &600);
+    assert_eq!(client.holder_count(), 1);
+}
+
+#[test]
+fn test_holder_count_unchanged_by_self_transfer() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    MockTokenClient::new(&env, &token_id).mint(&alice, &1000);
+
+    client.transfer(&alice, &alice, &1000);
+    assert_eq!(client.holder_count(), 0);
+}
+
+#[test]
+fn test_clawback_drops_holder_count_when_balance_reaches_zero() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
+    MockTokenClient::new(&env, &token_id).mint(&alice, &1000);
+
+    client.transfer(&alice, &bob, &600);
+    assert_eq!(client.holder_count(), 1);
+    client.transfer(&alice, &bob, &400);
+    assert_eq!(client.holder_count(), 1);
+
+    client.clawback(&admin, &bob, &600);
+    assert_eq!(client.holder_count(), 1, "partial clawback keeps bob as a holder");
+
+    client.clawback(&admin, &bob, &400);
+    assert_eq!(client.holder_count(), 0, "full clawback removes bob as a holder");
+}
+
+#[test]
+fn test_max_holders_blocks_new_holder_over_cap() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
+    MockTokenClient::new(&env, &token_id).mint(&alice, &1000);
+
+    client.set_max_holders(&admin, &Some(1));
+    assert_eq!(client.get_max_holders(), Some(1));
+
+    // alice -> bob moves everything: bob is the single holder, within the cap.
+    client.transfer(&alice, &bob, &1000);
+    assert_eq!(client.holder_count(), 1);
+
+    // Sending to alice would add a second holder and must be rejected.
+    let result = client.try_transfer(&bob, &alice, &400);
+    assert_eq!(result, Err(Ok(Error::MaxHoldersReached)));
+    assert_eq!(client.holder_count(), 1);
+
+    // Clearing the cap lets the same transfer through.
+    client.set_max_holders(&admin, &None);
+    assert_eq!(client.get_max_holders(), None);
+    client.transfer(&bob, &alice, &400);
+    assert_eq!(client.holder_count(), 2);
+}
+
+#[test]
+fn test_set_max_holders_rejects_non_admin() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    let intruder = Address::generate(&env);
+
+    let result = client.try_set_max_holders(&intruder, &Some(1));
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert_eq!(client.get_max_holders(), None);
+}
+
+#[test]
+fn test_remove_multiple_skips_absent_addresses_without_events() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let never_added = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    client.remove_multiple_from_allowlist(
+        &admin,
+        &vec![&env, never_added.clone(), alice.clone()],
+    );
+
+    // Only the real removal (alice) emits an event; the absent address does not.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (Symbol::new(&env, "allow_remove"), alice.clone()).into_val(&env),
+                Map::<Symbol, Val>::new(&env).into_val(&env),
+            ),
+        ]
+    );
+    assert!(!client.is_allowed(&alice));
+    assert!(client.get_allowlist_entry(&never_added).is_none());
+}
+
+#[test]
+fn test_add_to_allowlist_until_stores_expiry_on_entry() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist_until(&admin, &alice, &1_500);
+
+    let entry = client.get_allowlist_entry(&alice).unwrap();
+    assert_eq!(entry.expiration_ledger, Some(1_500));
+}
+
+#[test]
+fn test_add_to_allowlist_until_is_allowed_through_boundary_ledger() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist_until(&admin, &alice, &1_500);
+
+    // Inclusive: still allowed on the expiry ledger itself.
+    env.ledger().set_sequence_number(1_500);
+    assert!(client.is_allowed(&alice));
+    assert!(client.is_compliant(&alice));
+
+    // Not allowed from the ledger after expiry onward.
+    env.ledger().set_sequence_number(1_501);
+    assert!(!client.is_allowed(&alice));
+    assert!(!client.is_compliant(&alice));
+}
+
+#[test]
+fn test_add_to_allowlist_until_rejects_expiry_in_the_past() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+
+    assert_eq!(
+        client.try_add_to_allowlist_until(&admin, &alice, &999),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_transfer_blocked_after_time_limited_entry_expires() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist_until(&admin, &alice, &1_500);
+    client.add_to_allowlist(&admin, &bob, &None);
+
+    // On the expiry ledger the transfer is still forwarded.
+    env.ledger().set_sequence_number(1_500);
+    assert!(client.transfer(&alice, &bob, &10));
+
+    // After expiry the expired sender is blocked; the entry itself is kept.
+    env.ledger().set_sequence_number(1_501);
+    assert!(!client.transfer(&alice, &bob, &10));
+    assert_eq!(
+        client.get_allowlist_entry(&alice).unwrap().expiration_ledger,
+        Some(1_500)
+    );
+}
+
+#[test]
+fn test_add_to_allowlist_records_approver_and_ledger() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(777);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    let entry = client.get_allowlist_entry(&alice).unwrap();
+    assert_eq!(entry.expiration_ledger, None);
+    assert_eq!(entry.added_by, Some(admin));
+    assert_eq!(entry.added_at_ledger, Some(777));
+}
+
+#[test]
+fn test_add_multiple_to_allowlist_records_approver_and_ledger() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(888);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    client.add_multiple_to_allowlist(&admin, &vec![&env, alice.clone(), bob.clone()], &None);
+
+    for addr in [&alice, &bob] {
+        let entry = client.get_allowlist_entry(addr).unwrap();
+        assert_eq!(entry.added_by, Some(admin.clone()));
+        assert_eq!(entry.added_at_ledger, Some(888));
+    }
+}
+
+#[test]
+fn test_delegated_add_records_configured_admin_as_approver() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
+
+    env.ledger().set_timestamp(100);
+    env.ledger().set_sequence_number(555);
+    let expiry = 200u64;
+    let signature = sign_delegated_action(&env, &signing_key, &alice, 1, expiry);
+    client.add_to_allowlist_delegated(
+        &admin,
+        &alice,
+        &1u64,
+        &expiry,
+        &default_valid_until(&env),
+        &signature,
+    );
+
+    let entry = client.get_allowlist_entry(&alice).unwrap();
+    assert_eq!(entry.added_by, Some(admin));
+    assert_eq!(entry.added_at_ledger, Some(555));
+}
+
+#[test]
+fn test_readding_entry_replaces_provenance_with_latest_approval() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    env.ledger().set_sequence_number(10);
+    client.add_to_allowlist(&admin, &alice, &None);
+    env.ledger().set_sequence_number(20);
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    assert_eq!(client.get_allowlist_entry(&alice).unwrap().added_at_ledger, Some(20));
+}
+
+#[test]
+fn test_remove_clears_provenance() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    client.remove_from_allowlist(&admin, &alice);
+
+    assert!(client.get_allowlist_entry(&alice).is_none());
+}
+
+#[test]
+fn test_entry_without_provenance_reports_none_for_approver_fields() {
+    let env = Env::default();
+    let (_admin, _token_id, contract_id, client) = setup(&env);
+    let legacy = Address::generate(&env);
+
+    // Simulate an entry written before provenance was recorded.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowed(legacy.clone()), &AllowlistEntry { expiration_ledger: None });
+    });
+
+    let entry = client.get_allowlist_entry(&legacy).unwrap();
+    assert_eq!(entry.added_by, None);
+    assert_eq!(entry.added_at_ledger, None);
+    assert!(client.is_allowed(&legacy));
+}
+
+#[derive(Clone)]
+struct AllowanceData {
+    amount: i128,
+    expiration_ledger: u32,
+}
+
+fn allowance_key(env: &Env, from: &Address, spender: &Address) -> (Symbol, Address, Address) {
+    (Symbol::new(env, "allowance"), from.clone(), spender.clone())
+}
+
+
+/// Register a fresh allowlist-token with `alice` and `bob` allowlisted and
+/// funded on the underlying token. Returns the token double client too.
+fn setup_sep41(
+    env: &Env,
+) -> (
+    Address,
+    Address,
+    Address,
+    Address,
+    AllowlistTokenClient<'_>,
+    MockTokenClient<'_>,
+) {
+    let (admin, token_id, _contract_id, client) = setup(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
+    let token = MockTokenClient::new(env, &token_id);
+    token.set_balance(&alice, &1_000);
+    token.set_balance(&bob, &1_000);
+    token.set_total_supply(&2_000);
+    (admin, token_id, alice, bob, client, token)
+}
+
+#[test]
+fn sep41_decimals_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.decimals(), token.decimals());
+    assert_eq!(client.decimals(), 7);
+}
+
+#[test]
+fn sep41_name_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.name(), token.name());
+}
+
+#[test]
+fn sep41_symbol_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.symbol(), token.symbol());
+}
+
+#[test]
+fn sep41_total_supply_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.total_supply(), token.total_supply());
+    assert_eq!(client.total_supply(), 2_000);
+}
+
+#[test]
+fn sep41_balance_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.balance(&alice), token.balance(&alice));
+    assert_eq!(client.balance(&bob), token.balance(&bob));
+}
+
+#[test]
+fn sep41_balance_of_unknown_address_is_zero() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, _token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+    assert_eq!(client.balance(&stranger), 0);
+}
+
+#[test]
+fn sep41_allowance_defaults_to_zero() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, _token) = setup_sep41(&env);
+    assert_eq!(client.allowance(&alice, &bob), 0);
+}
+
+#[test]
+fn sep41_approve_sets_allowance_and_emits_event() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+
+    assert_eq!(client.allowance(&alice, &bob), 250);
+    assert_eq!(token.allowance(&alice, &bob), 250);
+
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, token.address);
+    assert_eq!(
+        topics,
+        (symbol_short!("approve"), alice.clone(), bob.clone()).into_val(&env)
+    );
+    assert_eq!(data, (250i128, expiration).into_val(&env));
+}
+
+#[test]
+fn sep41_approve_overwrites_previous_allowance() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, _token) = setup_sep41(&env);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    client.approve(&alice, &bob, &10, &expiration);
+    assert_eq!(client.allowance(&alice, &bob), 10);
+}
+
+#[test]
+fn sep41_allowance_expires_after_expiration_ledger() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, _token) = setup_sep41(&env);
+    let expiration = env.ledger().sequence() + 10;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    assert_eq!(client.allowance(&alice, &bob), 250);
+
+    // Advance past the expiration ledger: the allowance must read as zero.
+    env.ledger().set_sequence_number(expiration + 1);
+    assert_eq!(client.allowance(&alice, &bob), 0);
+}
+
+#[test]
+fn sep41_transfer_from_after_allowance_expiry_fails() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let carol = Address::generate(&env);
+    client.add_to_allowlist(&client.get_admin(), &carol, &None);
+    let expiration = env.ledger().sequence() + 10;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    env.ledger().set_sequence_number(expiration + 1);
+
+    assert_eq!(
+        client.try_transfer_from(&bob, &alice, &carol, &100),
+        Err(Ok(Error::InsufficientAllowance))
+    );
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_from_over_allowance_fails() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let carol = Address::generate(&env);
+    client.add_to_allowlist(&client.get_admin(), &carol, &None);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &50, &expiration);
+
+    assert_eq!(
+        client.try_transfer_from(&bob, &alice, &carol, &51),
+        Err(Ok(Error::InsufficientAllowance))
+    );
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_from_within_allowance_succeeds() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let carol = Address::generate(&env);
+    client.add_to_allowlist(&client.get_admin(), &carol, &None);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    assert!(client.transfer_from(&bob, &alice, &carol, &100));
+
+    assert_eq!(token.last_transfer(), Some((alice, carol, 100)));
+}
+
+#[test]
+fn sep41_transfer_emits_standard_event() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    assert!(client.transfer(&alice, &bob, &100));
+
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, token.address);
+    assert_eq!(
+        topics,
+        (symbol_short!("transfer"), alice.clone(), bob.clone()).into_val(&env)
+    );
+    assert_eq!(data, 100i128.into_val(&env));
+}
+
+#[test]
+fn sep41_zero_amount_transfer_is_allowed() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    assert!(client.transfer(&alice, &bob, &0));
+    assert_eq!(token.last_transfer(), Some((alice, bob, 0)));
+}
+
+#[test]
+fn sep41_self_transfer_is_allowed() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, _bob, client, token) = setup_sep41(&env);
+
+    assert!(client.transfer(&alice, &alice, &100));
+    assert_eq!(token.last_transfer(), Some((alice.clone(), alice, 100)));
+}
+
+#[test]
+fn sep41_negative_amount_transfer_is_rejected() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &-1),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_denied_when_sender_not_allowlisted() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, bob, client, token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+    token.set_balance(&stranger, &1_000);
+
+    assert!(!client.transfer(&stranger, &bob, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_denied_when_recipient_not_allowlisted() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, _bob, client, token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+
+    assert!(!client.transfer(&alice, &stranger, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_denied_when_allowlisted_after_removal() {
+    let env = Env::default();
+    let (admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    client.remove_from_allowlist(&admin, &bob);
+    assert!(!client.transfer(&alice, &bob, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_from_denied_when_recipient_not_allowlisted() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    assert!(!client.transfer_from(&bob, &alice, &stranger, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+/// End-to-end upgrade harness: deploy a real previous-release WASM, write
+/// state, replace the code with HEAD, and verify state remains readable.
+///
+/// Run through `scripts/test-migration.sh`, or set PREVIOUS_ALLOWLIST_WASM
+/// and HEAD_ALLOWLIST_WASM explicitly.
+#[test]
+fn test_previous_release_wasm_upgrade_preserves_state() {
+    let previous_path = std::env::var("PREVIOUS_ALLOWLIST_WASM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("PREVIOUS_WASM_DIR")
+                .map(|dir| PathBuf::from(dir).join("allowlist_token.wasm"))
+                .unwrap_or_default()
+        });
+    let head_path = std::env::var("HEAD_ALLOWLIST_WASM")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+
+    let previous = match std::fs::read(&previous_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "skipping migration test: previous WASM not configured ({:?}: {})",
+                previous_path, error
+            );
+            return;
+        }
+    };
+    let head = match std::fs::read(&head_path) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("HEAD WASM not found at {:?}: {}", head_path, error),
+    };
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(previous.as_slice(), ());
+    let client = AllowlistTokenClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &token);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    assert!(client.is_allowed(&alice));
+
+    let head_hash = env
+        .deployer()
+        .upload_contract_wasm(Bytes::from_slice(&env, &head));
+    env.as_contract(&contract_id, || {
+        env.deployer().update_current_contract_wasm(head_hash);
+    });
+
+    let metadata = client.metadata().unwrap();
+    assert_eq!(metadata.admin, admin);
+    assert!(client.is_allowed(&alice));
+
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &bob, &None);
+    assert!(client.is_allowed(&bob));
 }

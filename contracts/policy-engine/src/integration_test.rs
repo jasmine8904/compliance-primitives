@@ -23,7 +23,7 @@ use allowlist_token::{AllowlistToken, AllowlistTokenClient};
 use denylist_gate::{DenylistGate, DenylistGateClient};
 use jurisdiction_flag::{JurisdictionFlag, JurisdictionFlagClient};
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{vec, Address, Env, String};
+use soroban_sdk::{vec, Address, Env, String, Symbol};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,8 +62,12 @@ fn setup_jurisdiction(env: &Env, issuer: &Address) -> Address {
     id
 }
 
-/// Builds and configures a policy-engine with All semantics, wired with all
-/// three checks in order: Allowlist → Denylist → Jurisdiction.
+/// Name of the default policy used throughout these integration tests.
+const POLICY_NAME: &str = "transfer";
+
+/// Builds and configures a policy-engine with a single named policy
+/// (`POLICY_NAME`) using All semantics, wired with all three checks in order:
+/// Allowlist → Denylist → Jurisdiction.
 ///
 /// Returns `(engine_admin, engine_client)`.
 fn setup_engine_all_three<'a>(
@@ -76,22 +80,28 @@ fn setup_engine_all_three<'a>(
     let admin = Address::generate(env);
     let engine_id = env.register(PolicyEngine, ());
     let client = PolicyEngineClient::new(env, &engine_id);
-    client.initialize(&admin, &CombineOp::All, &None);
+    client.initialize(&admin);
+
+    let name = Symbol::new(env, POLICY_NAME);
+    client.create_policy(&admin, &name, &CombineOp::All, &None);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Allowlist(AllowlistCheck {
             contract: allowlist_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: denylist_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: jurisdiction_id.clone(),
             allowed_codes: vec![env, String::from_str(env, permitted_code)],
@@ -162,7 +172,7 @@ fn test_all_three_pass() {
         setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
 
     assert!(
-        engine.evaluate(&from, &to),
+        engine.evaluate_policy(&Symbol::new(&env, POLICY_NAME), &from, &to),
         "expected all-three-pass to return true"
     );
 }
@@ -204,7 +214,7 @@ fn test_fail_allowlist_check() {
         setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
 
     assert!(
-        !engine.evaluate(&from, &to),
+        !engine.evaluate_policy(&Symbol::new(&env, POLICY_NAME), &from, &to),
         "expected allowlist failure to return false"
     );
 }
@@ -255,7 +265,7 @@ fn test_fail_denylist_check() {
         setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
 
     assert!(
-        !engine.evaluate(&from, &to),
+        !engine.evaluate_policy(&Symbol::new(&env, POLICY_NAME), &from, &to),
         "expected denylist failure to return false"
     );
 }
@@ -298,7 +308,7 @@ fn test_fail_jurisdiction_check() {
         setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
 
     assert!(
-        !engine.evaluate(&from, &to),
+        !engine.evaluate_policy(&Symbol::new(&env, POLICY_NAME), &from, &to),
         "expected jurisdiction failure to return false"
     );
 }
@@ -341,16 +351,21 @@ fn test_or_semantics_any_check_passes() {
     let engine_admin = Address::generate(&env);
     let engine_id = env.register(PolicyEngine, ());
     let engine = PolicyEngineClient::new(&env, &engine_id);
-    engine.initialize(&engine_admin, &CombineOp::Any, &None);
+    engine.initialize(&engine_admin);
+
+    let name = Symbol::new(&env, POLICY_NAME);
+    engine.create_policy(&engine_admin, &name, &CombineOp::Any, &None);
 
     engine.add_check(
         &engine_admin,
+        &name,
         &CheckKind::Allowlist(AllowlistCheck {
             contract: allowlist_id.clone(),
         }),
     );
     engine.add_check(
         &engine_admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: denylist_id.clone(),
         }),
@@ -362,7 +377,7 @@ fn test_or_semantics_any_check_passes() {
     // With Any: allowlist passes for both → result should be true even though
     // denylist fails.
     assert!(
-        engine.evaluate(&from, &to),
+        engine.evaluate_policy(&name, &from, &to),
         "expected Any semantics to return true when at least one check passes for both parties"
     );
 }
@@ -412,7 +427,7 @@ fn test_verbose_all_reports_failing_check() {
     let (_admin, engine) =
         setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
 
-    match engine.evaluate_verbose(&from, &to) {
+    match engine.evaluate_verbose(&Symbol::new(&env, POLICY_NAME), &from, &to) {
         VerboseResult::Failed(failure) => {
             assert_eq!(
                 failure.check_index, 1,
@@ -459,28 +474,34 @@ fn test_verbose_any_all_failed_sentinel() {
     let engine_admin = Address::generate(&env);
     let engine_id = env.register(PolicyEngine, ());
     let engine = PolicyEngineClient::new(&env, &engine_id);
-    engine.initialize(&engine_admin, &CombineOp::Any, &None);
+    engine.initialize(&engine_admin);
+
+    let name = Symbol::new(&env, POLICY_NAME);
+    engine.create_policy(&engine_admin, &name, &CombineOp::Any, &None);
     engine.add_check(
         &engine_admin,
+        &name,
         &CheckKind::Allowlist(AllowlistCheck {
             contract: allowlist_id.clone(),
         }),
     );
     engine.add_check(
         &engine_admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: denylist_id.clone(),
         }),
     );
     engine.add_check(
         &engine_admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: jurisdiction_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, PERMITTED_CODE)],
         }),
     );
 
-    match engine.evaluate_verbose(&from, &to) {
+    match engine.evaluate_verbose(&name, &from, &to) {
         VerboseResult::Failed(failure) => {
             assert_eq!(
                 failure.check_index,
@@ -495,4 +516,89 @@ fn test_verbose_any_all_failed_sentinel() {
         }
         VerboseResult::Passed => panic!("expected Any policy to fail when every check fails"),
     }
+}
+
+/// Amount-aware evaluation: the policy combines the allowlist, denylist and
+/// jurisdiction gates with an amount-aware check.  A transfer below the
+/// travel-rule threshold passes; one above it is rejected.  The result also
+/// carries the monotonic `policy_version`, which must be bumped whenever the
+/// policy changes.
+#[test]
+fn test_evaluate_with_amount_and_version() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let allowlist_admin = Address::generate(&env);
+    let denylist_admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    let allowlist_id = setup_allowlist(&env, &allowlist_admin);
+    let denylist_id = setup_denylist(&env, &denylist_admin);
+    let jurisdiction_id = setup_jurisdiction(&env, &issuer);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    onboard(
+        &env,
+        &allowlist_id,
+        &allowlist_admin,
+        &jurisdiction_id,
+        &issuer,
+        &from,
+        PERMITTED_CODE,
+    );
+    onboard(
+        &env,
+        &allowlist_id,
+        &allowlist_admin,
+        &jurisdiction_id,
+        &issuer,
+        &to,
+        PERMITTED_CODE,
+    );
+
+    let (admin, engine) =
+        setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
+    let name = Symbol::new(&env, POLICY_NAME);
+
+    // The version starts at 1 after the policy is created and its checks added.
+    let version_before = engine.get_policy(&name).policy_version;
+    assert!(version_before >= 1, "policy_version must be monotonic from 1");
+
+    // Below the travel-rule threshold: all gates pass.
+    let small = engine.evaluate_with_amount(&name, &from, &to, &Some(100));
+    assert!(small.allowed, "small transfer must be allowed");
+    assert_eq!(
+        small.policy_version, version_before,
+        "evaluation must report the current policy version"
+    );
+
+    // Above the travel-rule threshold: the amount-aware check rejects it.
+    let large = engine.evaluate_with_amount(&name, &from, &to, &Some(1_000_000));
+    assert!(!large.allowed, "large transfer must be rejected");
+    assert_eq!(
+        large.policy_version, version_before,
+        "rejection must still report the current policy version"
+    );
+
+    // Changing the policy bumps the version; subsequent evaluations report it.
+    engine.add_check(
+        &admin,
+        &name,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: denylist_id.clone(),
+        }),
+    );
+    let version_after = engine.get_policy(&name).policy_version;
+    assert!(
+        version_after > version_before,
+        "policy_version must increase on every policy change"
+    );
+
+    let result = engine.evaluate_with_amount(&name, &from, &to, &Some(100));
+    assert_eq!(
+        result.policy_version, version_after,
+        "evaluation must report the bumped policy version"
+    );
 }

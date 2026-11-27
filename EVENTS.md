@@ -81,12 +81,13 @@ Emitted when an address is added to the allowlist.
 
 ```
 topics : ["allow_add", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address added to the allowlist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `AllowRemove`
 
@@ -96,12 +97,13 @@ removal is a no-op but the event is still emitted for auditability.
 
 ```
 topics : ["allow_remove", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address removed from the allowlist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `AddressFrozen`
 
@@ -246,12 +248,13 @@ address in a batch `add_multiple_to_denylist` call.
 
 ```
 topics : ["deny_add", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address added to the denylist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `DenyRemove`
 
@@ -261,12 +264,13 @@ removal is a no-op but the event is still emitted for auditability.
 
 ```
 topics : ["deny_remove", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address removed from the denylist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `AdminTransferred`
 
@@ -379,13 +383,14 @@ one was already set).
 
 ```
 topics : ["jurisdiction_set", <address: Address>]
-data   : { "code": <String> }
+data   : { "code": <String>, "previous": <Vec<String>> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address whose jurisdiction was set |
 | `code` | `String` | data | ISO 3166-1 alpha-2 (or similar) jurisdiction code |
+| `previous` | `Vec<String>` | data | Stored codes before the call (empty if none) |
 
 > **Note — payload in data**: unlike `DenyAdd`/`AllowAdd` where the topic
 > address is the entire meaningful payload, `JurisdictionSet` carries a
@@ -426,6 +431,32 @@ data   : {}
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `caller` | `Address` | topic | Admin or guardian address that froze the contract |
+
+#### `TimedFrozen`
+
+Emitted by `freeze_for(caller, ledgers)`. The freeze lifts automatically once
+the ledger sequence reaches `until_ledger`; `is_frozen` then returns `false`.
+
+```
+topics : ["timed_frozen", <caller: Address>]
+data   : { until_ledger: u32 }
+```
+
+#### `ScopeFrozen` / `ScopeUnfrozen`
+
+Emitted by `freeze_scope(caller, scope)` (admin or guardian) and
+`unfreeze_scope(admin, scope)` (admin only). Consumers check a single
+operation with `is_frozen_scope(scope)`; the global freeze (permanent or
+timed) always overrides and reports every scope as frozen.
+
+```
+topics : ["scope_frozen", <caller: Address>, <scope: Symbol>]
+topics : ["scope_unfrozen", <admin: Address>, <scope: Symbol>]
+data   : {}
+```
+
+Guardians are capped at `MAX_GUARDIANS` (10); `add_guardian` beyond the cap
+fails with `TooManyGuardians`. `list_guardians()` returns the current set.
 
 #### `Unfrozen`
 

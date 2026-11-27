@@ -60,6 +60,78 @@ echo "Release version : $VERSION"
 echo "Git tag         : $TAG"
 
 # ---------------------------------------------------------------------------
+# Regenerate per-contract changelog sections with git-cliff
+# ---------------------------------------------------------------------------
+# Each contract keeps its own section in CHANGELOG.md, delimited by markers:
+#   <!-- contract:<name>:start -->
+#   ...generated content...
+#   <!-- contract:<name>:end -->
+# The generated content is produced by git-cliff using the per-package
+# configuration at contracts/<name>/cliff.toml.
+CONTRACTS_DIR="contracts"
+CLIFF_BIN="${CLIFF_BIN:-git-cliff}"
+
+if ! command -v "$CLIFF_BIN" &>/dev/null; then
+  echo "error: '$CLIFF_BIN' is required to generate per-contract changelogs" >&2
+  echo "       Install it with: cargo install git-cliff" >&2
+  exit 1
+fi
+
+if [ ! -d "$CONTRACTS_DIR" ]; then
+  echo "error: contracts directory '$CONTRACTS_DIR' not found" >&2
+  exit 1
+fi
+
+# Collect contract names (subdirectories containing a cliff.toml).
+CONTRACTS=()
+for cliff_cfg in "$CONTRACTS_DIR"/*/cliff.toml; do
+  [ -e "$cliff_cfg" ] || continue
+  CONTRACTS+=("$(basename "$(dirname "$cliff_cfg")")")
+done
+
+if [ "${#CONTRACTS[@]}" -eq 0 ]; then
+  echo "error: no per-contract cliff.toml files found under '$CONTRACTS_DIR/*/'" >&2
+  exit 1
+fi
+
+# Regenerate each contract's section in place.
+for contract in "${CONTRACTS[@]}"; do
+  cliff_cfg="$CONTRACTS_DIR/$contract/cliff.toml"
+  start_marker="<!-- contract:${contract}:start -->"
+  end_marker="<!-- contract:${contract}:end -->"
+
+  if ! grep -qF "$start_marker" CHANGELOG.md || ! grep -qF "$end_marker" CHANGELOG.md; then
+    echo "error: CHANGELOG.md is missing markers for contract '$contract'" >&2
+    echo "       Expected: $start_marker ... $end_marker" >&2
+    exit 1
+  fi
+
+  contract_notes=$("$CLIFF_BIN" \
+    --config "$cliff_cfg" \
+    --tag-pattern "^${contract}-v[0-9].*" \
+    --unreleased \
+    --strip header 2>/dev/null || true)
+
+  if [ -z "$contract_notes" ]; then
+    contract_notes="_No changes for this contract._"
+  fi
+
+  # Replace the content between the markers with the freshly generated notes.
+  awk \
+    -v start="$start_marker" \
+    -v end="$end_marker" \
+    -v notes="$contract_notes" \
+    'BEGIN{in_block=0}
+     $0 == start {print; print notes; in_block=1; next}
+     $0 == end   {in_block=0; print; next}
+     !in_block   {print}' \
+    CHANGELOG.md > CHANGELOG.md.tmp
+  mv CHANGELOG.md.tmp CHANGELOG.md
+
+  echo "Regenerated changelog section for contract: $contract"
+done
+
+# ---------------------------------------------------------------------------
 # Extract the changelog section for this version
 # ---------------------------------------------------------------------------
 # Looks for a block that starts with "## [<version>]" and ends just before the
@@ -80,6 +152,14 @@ if [ -z "$CHANGELOG_SECTION" ]; then
   echo "       Expected a heading like:  ## [$VERSION]" >&2
   exit 1
 fi
+
+# Fail if any per-contract section is missing from the release notes.
+for contract in "${CONTRACTS[@]}"; do
+  if ! grep -qF "<!-- contract:${contract}:start -->" <<<"$CHANGELOG_SECTION"; then
+    echo "error: release notes for $VERSION are missing the section for contract '$contract'" >&2
+    exit 1
+  fi
+done
 
 echo ""
 echo "--- Changelog section ---"

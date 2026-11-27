@@ -23,3 +23,7 @@ Cargo.lock.bak
 
 # Node tooling (scripts/check-accessibility.mjs) — see package.json.
 node_modules/
+
+# deploy-all output and local config (may contain key identities)
+scripts/deploy-config.json
+deployed-ids.json

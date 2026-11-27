@@ -136,7 +136,7 @@
 use soroban_sdk::{
     contractmeta,
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address,
-    BytesN, Env, String, Symbol, Vec,
+    Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
@@ -156,10 +156,10 @@ pub const MAX_DETAIL_LEN: u32 = 256;
 
 /// Extend a persistent log entry when its remaining TTL drops below this many
 /// ledgers (~7 days at ~5s/ledger).
-pub const ENTRY_TTL_THRESHOLD: u32 = 120_960;
+pub const ENTRY_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD;
 /// Target remaining TTL, in ledgers, after an entry is extended (~90 days at
 /// ~5s/ledger).
-pub const ENTRY_TTL_EXTEND_TO: u32 = 1_555_200;
+pub const ENTRY_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO;
 
 // ---------------------------------------------------------------------------
 // Storage types
@@ -167,7 +167,7 @@ pub const ENTRY_TTL_EXTEND_TO: u32 = 1_555_200;
 
 /// A single compliance event stored on-chain.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogEntry {
     /// The contract (or EOA) that called `record` — typically one of the
     /// compliance-primitive contracts acting as the recording source.
@@ -182,6 +182,10 @@ pub struct LogEntry {
     pub detail: String,
     /// The ledger sequence number at the time of recording.
     pub ledger: u32,
+    /// The SHA-256 hash of the preceding entry in the audit log (zeros for entry 0).
+    pub prev_hash: BytesN<32>,
+    /// The SHA-256 hash of this entry.
+    pub hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -193,6 +197,18 @@ enum DataKey {
     EntryCount,
     /// Individual log entry keyed by its zero-based index.
     Entry(u64),
+    /// Hash of the most recent log entry (head of the chain).
+    HeadHash,
+    /// Authorized writer allowlist indicator.
+    Writer(Address),
+    /// Total count of entries associated with an actor (source or subject).
+    ActorCount(Address),
+    /// Index mapping for an actor: (actor, actor_seq) -> entry index.
+    ActorEntry(Address, u64),
+    /// Total count of entries associated with an action (kind).
+    ActionCount(Symbol),
+    /// Index mapping for an action: (action, action_seq) -> entry index.
+    ActionEntry(Symbol, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +248,24 @@ pub struct Unpaused {
     pub admin: Address,
 }
 
+/// Emitted when a writer is added to the allowlist.
+#[contractevent]
+pub struct WriterAdded {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub writer: Address,
+}
+
+/// Emitted when a writer is removed from the allowlist.
+#[contractevent]
+pub struct WriterRemoved {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub writer: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -249,6 +283,8 @@ pub enum Error {
     ContractPaused = 5,
     /// `detail` string passed to `record` exceeds [`MAX_DETAIL_LEN`] bytes.
     DetailTooLong = 6,
+    /// The caller is not an authorized writer in the allowlist.
+    NotWriter = 7,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +333,14 @@ impl AuditLog {
         Ok(())
     }
 
+    /// Return the stored admin address.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
     /// Pause all write operations. Admin-only.
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
@@ -317,6 +361,67 @@ impl AuditLog {
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Add an address to the writer allowlist. Admin-only.
+    pub fn add_writer(env: Env, admin: Address, writer: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Writer(writer.clone()), &true);
+        WriterAdded { admin, writer }.publish(&env);
+        Ok(())
+    }
+
+    /// Remove an address from the writer allowlist. Admin-only.
+    pub fn remove_writer(env: Env, admin: Address, writer: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::Writer(writer.clone()));
+        WriterRemoved { admin, writer }.publish(&env);
+        Ok(())
+    }
+
+    /// Check if an address is on the writer allowlist.
+    pub fn is_writer(env: Env, writer: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Writer(writer))
+            .unwrap_or(false)
+    }
+
+    /// Return the head hash of the audit log chain (hash of the latest entry,
+    /// or 32 zero bytes if no entries have been recorded).
+    pub fn head_hash(env: Env) -> BytesN<32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::HeadHash)
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Deterministically compute the SHA-256 hash for a log entry from its components.
+    pub fn compute_hash(
+        env: Env,
+        prev_hash: BytesN<32>,
+        source: Address,
+        kind: Symbol,
+        subject: Address,
+        detail: String,
+        ledger: u32,
+    ) -> BytesN<32> {
+        let mut data = Bytes::new(&env);
+        data.extend_from_array(&prev_hash.to_array());
+        data.append(&source.to_string().to_bytes());
+        data.push_back(b':');
+        data.extend_from_array(&kind.to_val().get_payload().to_be_bytes());
+        data.push_back(b':');
+        data.append(&subject.to_string().to_bytes());
+        data.push_back(b':');
+        data.append(&detail.to_bytes());
+        data.push_back(b':');
+        data.extend_from_array(&ledger.to_be_bytes());
+        env.crypto().sha256(&data).to_bytes()
     }
 
     /// Check if the contract is currently paused.
@@ -346,7 +451,20 @@ impl AuditLog {
     /// `source` must authorize this call (i.e. the calling contract must
     /// pass its own address as `source` and Soroban's auth framework will
     /// verify the invocation). This ensures entries cannot be forged by an
-    /// address other than the one claiming to be the source.
+    /// address other than the one claiming to be the source. `source` must
+    /// also be in the admin-managed writer allowlist.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Called by a consumer contract, which passes its own address as `source`.
+    /// audit_log.record(
+    ///     &consumer,
+    ///     &symbol_short!("freeze"),
+    ///     &subject,
+    ///     &String::from_str(&env, "breaker tripped"),
+    /// );
+    /// ```
     pub fn record(
         env: Env,
         source: Address,
@@ -359,6 +477,11 @@ impl AuditLog {
         // Contract must be initialized before accepting entries.
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
+        }
+
+        // Only allowlisted writers may record entries.
+        if !Self::is_writer(env.clone(), source.clone()) {
+            return Err(Error::NotWriter);
         }
 
         // Reject oversized detail strings to cap per-entry storage cost.
@@ -375,12 +498,26 @@ impl AuditLog {
             .get(&DataKey::EntryCount)
             .unwrap_or(0u64);
 
+        let ledger = env.ledger().sequence();
+        let prev_hash = Self::head_hash(env.clone());
+        let hash = Self::compute_hash(
+            env.clone(),
+            prev_hash.clone(),
+            source.clone(),
+            kind.clone(),
+            subject.clone(),
+            detail.clone(),
+            ledger,
+        );
+
         let entry = LogEntry {
             source: source.clone(),
             kind: kind.clone(),
             subject: subject.clone(),
             detail: detail.clone(),
-            ledger: env.ledger().sequence(),
+            ledger,
+            prev_hash,
+            hash: hash.clone(),
         };
 
         let entry_key = DataKey::Entry(index);
@@ -392,6 +529,78 @@ impl AuditLog {
         env.storage()
             .instance()
             .set(&DataKey::EntryCount, &(index + 1));
+        env.storage().instance().set(&DataKey::HeadHash, &hash);
+
+        // Maintain secondary index by action (kind).
+        let action_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActionCount(kind.clone()))
+            .unwrap_or(0);
+        let action_entry_key = DataKey::ActionEntry(kind.clone(), action_count);
+        env.storage().persistent().set(&action_entry_key, &index);
+        env.storage().persistent().extend_ttl(
+            &action_entry_key,
+            ENTRY_TTL_THRESHOLD,
+            ENTRY_TTL_EXTEND_TO,
+        );
+        let action_count_key = DataKey::ActionCount(kind.clone());
+        env.storage()
+            .persistent()
+            .set(&action_count_key, &(action_count + 1));
+        env.storage().persistent().extend_ttl(
+            &action_count_key,
+            ENTRY_TTL_THRESHOLD,
+            ENTRY_TTL_EXTEND_TO,
+        );
+
+        // Maintain secondary index by actor (source).
+        let source_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActorCount(source.clone()))
+            .unwrap_or(0);
+        let source_entry_key = DataKey::ActorEntry(source.clone(), source_count);
+        env.storage().persistent().set(&source_entry_key, &index);
+        env.storage().persistent().extend_ttl(
+            &source_entry_key,
+            ENTRY_TTL_THRESHOLD,
+            ENTRY_TTL_EXTEND_TO,
+        );
+        let source_count_key = DataKey::ActorCount(source.clone());
+        env.storage()
+            .persistent()
+            .set(&source_count_key, &(source_count + 1));
+        env.storage().persistent().extend_ttl(
+            &source_count_key,
+            ENTRY_TTL_THRESHOLD,
+            ENTRY_TTL_EXTEND_TO,
+        );
+
+        // If subject is different from source, also index subject under actor.
+        if subject != source {
+            let subject_count: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ActorCount(subject.clone()))
+                .unwrap_or(0);
+            let subject_entry_key = DataKey::ActorEntry(subject.clone(), subject_count);
+            env.storage().persistent().set(&subject_entry_key, &index);
+            env.storage().persistent().extend_ttl(
+                &subject_entry_key,
+                ENTRY_TTL_THRESHOLD,
+                ENTRY_TTL_EXTEND_TO,
+            );
+            let subject_count_key = DataKey::ActorCount(subject.clone());
+            env.storage()
+                .persistent()
+                .set(&subject_count_key, &(subject_count + 1));
+            env.storage().persistent().extend_ttl(
+                &subject_count_key,
+                ENTRY_TTL_THRESHOLD,
+                ENTRY_TTL_EXTEND_TO,
+            );
+        }
 
         ComplianceEvent {
             kind,
@@ -414,12 +623,38 @@ impl AuditLog {
 
     /// Return up to `count` log entries starting at zero-based index `start`.
     ///
-    /// Unlike [`AuditLog::list_entries`], an oversized `count` is clamped to
-    /// [`MAX_PAGE_SIZE`] rather than rejected. Fewer entries are returned when
-    /// the range runs past `entry_count()`.
+    /// Deprecated: use [`AuditLog::list_entries`] instead for consistent pagination
+    /// and error handling.
+    #[deprecated(note = "use list_entries instead")]
     pub fn get_entries(env: Env, start: u64, count: u32) -> Vec<LogEntry> {
         let limit = count.min(MAX_PAGE_SIZE);
         Self::list_entries(env.clone(), start, limit).unwrap_or(Vec::new(&env))
+    }
+
+    /// Return up to `n` of the most recent log entries, **newest first**.
+    ///
+    /// `n` is clamped to [`MAX_PAGE_SIZE`]. Fewer entries are returned when
+    /// the log holds fewer than `n`; an empty log yields an empty vector.
+    /// Lets dashboards read the tail of the log without computing offsets
+    /// from `entry_count()`.
+    pub fn latest_entries(env: Env, n: u32) -> Vec<LogEntry> {
+        let count = Self::entry_count(env.clone());
+        let take = (n.min(MAX_PAGE_SIZE) as u64).min(count);
+
+        let mut entries = Vec::new(&env);
+        let mut offset: u64 = 0;
+        while offset < take {
+            let index = count - 1 - offset;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, LogEntry>(&DataKey::Entry(index))
+            {
+                entries.push_back(entry);
+            }
+            offset += 1;
+        }
+        entries
     }
 
     /// Return the total number of entries recorded so far.
@@ -464,6 +699,132 @@ impl AuditLog {
         }
 
         Ok(entries)
+    }
+
+    /// Return a paginated list of entries associated with `actor` (as source or subject).
+    pub fn list_entries_by_actor(
+        env: Env,
+        actor: Address,
+        start: u64,
+        limit: u32,
+    ) -> Result<Vec<LogEntry>, Error> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(Error::PageTooLarge);
+        }
+
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActorCount(actor.clone()))
+            .unwrap_or(0);
+
+        let mut entries = Vec::new(&env);
+        let mut index = start;
+        let mut collected: u32 = 0;
+        while collected < limit && index < total {
+            if let Some(entry_idx) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u64>(&DataKey::ActorEntry(actor.clone(), index))
+            {
+                if let Some(entry) = Self::get_entry(env.clone(), entry_idx) {
+                    entries.push_back(entry);
+                }
+            }
+            index += 1;
+            collected += 1;
+        }
+
+        Ok(entries)
+    }
+
+    /// Return a paginated list of entries associated with `action` (kind).
+    pub fn list_entries_by_action(
+        env: Env,
+        action: Symbol,
+        start: u64,
+        limit: u32,
+    ) -> Result<Vec<LogEntry>, Error> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(Error::PageTooLarge);
+        }
+
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActionCount(action.clone()))
+            .unwrap_or(0);
+
+        let mut entries = Vec::new(&env);
+        let mut index = start;
+        let mut collected: u32 = 0;
+        while collected < limit && index < total {
+            if let Some(entry_idx) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u64>(&DataKey::ActionEntry(action.clone(), index))
+            {
+                if let Some(entry) = Self::get_entry(env.clone(), entry_idx) {
+                    entries.push_back(entry);
+                }
+            }
+            index += 1;
+            collected += 1;
+        }
+
+        Ok(entries)
+    }
+
+    /// Verifies the cryptographic integrity of the log hash chain starting at `start`
+    /// for up to `limit` entries. Returns true if all checked hashes and prev_hashes match.
+    pub fn verify_chain(env: Env, start: u64, limit: u32) -> Result<bool, Error> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(Error::PageTooLarge);
+        }
+
+        let count = Self::entry_count(env.clone());
+        let mut index = start;
+        let mut checked: u32 = 0;
+
+        while checked < limit && index < count {
+            let entry = match Self::get_entry(env.clone(), index) {
+                Some(e) => e,
+                None => return Ok(false),
+            };
+
+            // Expected prev_hash
+            let expected_prev_hash = if index == 0 {
+                BytesN::from_array(&env, &[0u8; 32])
+            } else {
+                match Self::get_entry(env.clone(), index - 1) {
+                    Some(prev) => prev.hash,
+                    None => return Ok(false),
+                }
+            };
+
+            if entry.prev_hash != expected_prev_hash {
+                return Ok(false);
+            }
+
+            let computed = Self::compute_hash(
+                env.clone(),
+                entry.prev_hash.clone(),
+                entry.source.clone(),
+                entry.kind.clone(),
+                entry.subject.clone(),
+                entry.detail.clone(),
+                entry.ledger,
+            );
+
+            if entry.hash != computed {
+                return Ok(false);
+            }
+
+            index += 1;
+            checked += 1;
+        }
+
+        Ok(true)
     }
 
     /// Require `admin` to authorize the call and to match the stored admin.

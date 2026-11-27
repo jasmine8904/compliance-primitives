@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Batched multi-check aggregator that composes denylist-gate and jurisdiction-flag into a single cross-contract call."
+description = "Batched multi-check aggregator for denylist-gate, jurisdiction-flag, and allowlist-token."
 publish = false
 
 [lib]
@@ -12,8 +12,10 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
+compliance-ttl = { workspace = true }
 soroban-sdk = { workspace = true }
 compliance-pausable = { workspace = true }
+compliance-check = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

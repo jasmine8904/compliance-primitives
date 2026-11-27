@@ -2,8 +2,8 @@ use crate::{
     is_paused, pause, pause_with_reason, paused_since, pause_reason, require_not_paused,
     require_paused, unpause,
 };
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, TryFromVal, Val};
 
 /// Minimal harness contract so we can exercise the pausable helpers inside a
 /// real Soroban `Env`. All calls go through `env.register(Harness, ())`,
@@ -29,12 +29,37 @@ impl Harness {
         crate::unpause(&env);
     }
 
+    pub fn pause_until(env: Env, until: u64) {
+        crate::pause_until(&env, until);
+    }
+
+    pub fn pause_until_at(env: Env) -> Option<u64> {
+        crate::pause_until_at(&env)
+    }
+
     pub fn paused_since(env: Env) -> Option<u64> {
         crate::paused_since(&env)
     }
 
     pub fn pause_reason(env: Env) -> Option<String> {
         crate::pause_reason(&env)
+    }
+
+    pub fn pause_scope(env: Env, scope: crate::PauseScope) {
+        crate::pause_scope(&env, scope);
+    }
+
+    pub fn unpause_scope(env: Env, scope: crate::PauseScope) {
+        crate::unpause_scope(&env, scope);
+    }
+
+    pub fn is_paused_scope(env: Env, scope: crate::PauseScope) -> bool {
+        crate::is_paused_scope(&env, scope)
+    }
+
+    pub fn check_not_paused_scope(env: Env, scope: crate::PauseScope) -> bool {
+        crate::require_not_paused_scope(&env, scope);
+        true
     }
 
     /// Calls `require_not_paused` and returns `true` if the call succeeds
@@ -50,6 +75,28 @@ impl Harness {
     pub fn check_paused(env: Env) -> bool {
         crate::require_paused(&env);
         true
+    }
+
+    // ─── pauser role ────────────────────────────────────────────────────────
+
+    pub fn set_pauser(env: Env, admin: Address, pauser: Address) {
+        crate::set_pauser(&env, &admin, &pauser);
+    }
+
+    pub fn clear_pauser(env: Env, admin: Address) {
+        crate::clear_pauser(&env, &admin);
+    }
+
+    pub fn get_pauser(env: Env) -> Option<Address> {
+        crate::get_pauser(&env)
+    }
+
+    pub fn pause_as_pauser(env: Env, pauser: Address) {
+        crate::pause_as_pauser(&env, &pauser);
+    }
+
+    pub fn unpause_as_pauser(env: Env, pauser: Address) {
+        crate::unpause_as_pauser(&env, &pauser);
     }
 }
 
@@ -296,4 +343,277 @@ fn test_pause_no_reason_leaves_reason_none() {
     client.pause(); // no reason supplied
     assert!(client.is_paused());
     assert!(client.pause_reason().is_none());
+}
+
+// ─── Issue #804: automatic pause expiry ────────────────────────────────────
+
+#[test]
+fn test_pause_until_expires_automatically() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_700_000_000);
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause_until(&1_700_000_600);
+    assert!(client.is_paused());
+    assert_eq!(client.pause_until_at(), Some(1_700_000_600));
+    assert_eq!(client.paused_since(), Some(1_700_000_000));
+    assert!(client.check_paused());
+
+    // Half a second before expiry it is still paused; exactly at expiry it
+    // resumes without an explicit unpause.
+    env.ledger().set_timestamp(1_700_000_599);
+    assert!(client.is_paused());
+    env.ledger().set_timestamp(1_700_000_600);
+    assert!(!client.is_paused());
+    assert!(client.check_not_paused());
+    assert!(client.paused_since().is_none());
+}
+
+#[test]
+fn test_pause_until_in_the_past_is_a_noop() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_700_000_000);
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause_until(&1_699_999_999);
+    assert!(!client.is_paused());
+    assert!(client.pause_until_at().is_none());
+}
+
+#[test]
+fn test_unpause_clears_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_700_000_000);
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause_until(&1_700_001_000);
+    client.unpause();
+    assert!(!client.is_paused());
+    assert!(client.pause_until_at().is_none());
+}
+
+// ─── Issue #805: feature-scoped pauses ─────────────────────────────────────
+
+#[test]
+fn test_scoped_pause_isolates_other_features() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+    use crate::PauseScope;
+
+    assert!(!client.is_paused());
+    client.pause_scope(&PauseScope::Mint);
+    assert!(!client.is_paused());
+    assert!(client.is_paused_scope(&PauseScope::Mint));
+    assert!(!client.is_paused_scope(&PauseScope::Redeem));
+    assert!(client.check_not_paused_scope(&PauseScope::Redeem));
+}
+
+#[test]
+fn test_global_pause_overrides_every_scope() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+    use crate::PauseScope;
+
+    client.pause();
+    for scope in [
+        PauseScope::Mint,
+        PauseScope::Redeem,
+        PauseScope::Transfer,
+        PauseScope::Admin,
+    ] {
+        assert!(client.is_paused_scope(&scope));
+    }
+}
+
+#[test]
+fn test_unpause_scope_and_global_unpause() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+    use crate::PauseScope;
+
+    client.pause_scope(&PauseScope::Mint);
+    client.pause_scope(&PauseScope::Redeem);
+    client.unpause_scope(&PauseScope::Mint);
+    assert!(!client.is_paused_scope(&PauseScope::Mint));
+    assert!(client.is_paused_scope(&PauseScope::Redeem));
+
+    client.unpause();
+    assert!(!client.is_paused_scope(&PauseScope::Redeem));
+}
+
+/// Returns `true` if the event log contains an event whose first topic is
+/// `name` and whose data equals `data`.
+fn has_event(env: &Env, name: &str, data: &Val) -> bool {
+    let target = Symbol::new(env, name);
+    env.events().all().iter().any(|(_, topics, value)| {
+        let topic_matches = topics
+            .get(0)
+            .map(|t| Symbol::try_from_val(env, &t) == Ok(target.clone()))
+            .unwrap_or(false);
+        topic_matches && value == *data
+    })
+}
+
+#[test]
+fn test_get_pauser_default_is_none() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    assert!(client.get_pauser().is_none());
+}
+
+#[test]
+fn test_admin_can_set_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+
+    client.set_pauser(&admin, &pauser);
+    assert_eq!(client.get_pauser(), Some(pauser));
+}
+
+#[test]
+fn test_pauser_can_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    assert!(!client.is_paused());
+    client.pause_as_pauser(&pauser);
+    assert!(client.is_paused());
+}
+
+#[test]
+#[should_panic]
+fn test_non_pauser_cannot_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    let stranger = Address::generate(&env);
+    client.pause_as_pauser(&stranger);
+}
+
+#[test]
+#[should_panic]
+fn test_pauser_cannot_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    client.pause_as_pauser(&pauser);
+    assert!(client.is_paused());
+
+    // Pauser must not be able to unpause.
+    client.unpause_as_pauser(&pauser);
+}
+
+#[test]
+#[should_panic]
+fn test_non_admin_cannot_set_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    // The pauser is not the admin and must not be able to rotate itself.
+    let other = Address::generate(&env);
+    client.set_pauser(&pauser, &other);
+}
+
+#[test]
+#[should_panic]
+fn test_non_admin_cannot_clear_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    client.clear_pauser(&pauser);
+}
+
+#[test]
+fn test_admin_can_clear_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+    assert_eq!(client.get_pauser(), Some(pauser));
+
+    client.clear_pauser(&admin);
+    assert!(client.get_pauser().is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_cleared_pauser_loses_pause_authority() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+    client.clear_pauser(&admin);
+
+    // The previously authorized pauser must no longer be able to pause.
+    client.pause_as_pauser(&pauser);
+}
+
+#[test]
+fn test_pauser_change_events_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+
+    client.set_pauser(&admin, &pauser);
+    let set_data = Val::try_from_val(&env, &Some(pauser.clone())).unwrap();
+    assert!(has_event(&env, "pauser_set", &set_data));
+
+    client.clear_pauser(&admin);
+    let cleared_data = Val::try_from_val(&env, &Option::<Address>::None).unwrap();
+    assert!(has_event(&env, "pauser_cleared", &cleared_data));
 }

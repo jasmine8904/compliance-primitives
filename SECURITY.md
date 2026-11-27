@@ -54,7 +54,17 @@ the issue, and steps to reproduce if possible.
 
 ## What to expect
 
-We aim to acknowledge new reports within a few business days and to keep
-you updated as we investigate and work on a fix. Once a fix is available,
-we'll coordinate on disclosure timing with you before making the report
-public.
+Our targets, measured in business days from when we receive a report:
+
+- **Acknowledgement:** within 3 business days.
+- **Triage and severity assessment:** within 7 business days. We will tell
+  you whether we consider the report valid and its severity.
+- **Fix or mitigation:** critical issues within 30 days, high-severity issues
+  within 60 days, other valid issues within 90 days. Complex fixes that
+  need more time are communicated to you with a revised date.
+- **Status updates:** at least every 14 days until the issue is resolved.
+
+We will coordinate disclosure timing with you before publishing anything.
+By default, public disclosure happens once a fix is released, or 90 days
+after the report if no fix is available, whichever comes first. We will
+credit reporters in the advisory unless you ask us not to.

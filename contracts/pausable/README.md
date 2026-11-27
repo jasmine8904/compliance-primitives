@@ -52,6 +52,90 @@ contract to wire up its own admin-gated `pause`/`unpause`/`is_paused`
 methods and event emission — see `denylist-gate` or `jurisdiction-flag` for
 a worked example.
 
+## Recommended key setup: separate pauser role
+
+Requiring the admin key to pause slows incident response: the admin key is
+typically cold (hardware wallet, multisig, offline) and unpausing is the
+*recovery* action, not the emergency one. The recommended setup splits the
+two:
+
+- **Pauser key (hot):** can only `pause()`. Kept online/available so an
+  operator can halt state-mutating methods the moment an incident is
+  detected. It cannot unpause, so a compromised pauser key can at worst
+  cause a denial of service — it can never reopen a contract that was
+  deliberately paused.
+- **Admin key (cold):** can `unpause()` and rotate the pauser via
+  `set_pauser()`. Kept offline and used only for recovery and key
+  rotation, so it is rarely exposed.
+
+Use the pauser for routine incident response (suspicious activity, an
+exploit in progress, a bad deploy). Use the admin when the contract must
+be brought back into service, or when the pauser key needs replacing
+(rotation, suspected compromise, staff change).
+
+### Wiring it up
+
+```rust
+use soroban_sdk::{contracterror, contractevent, Address, Env};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    // ...
+    ContractPaused = 4,
+    NotAuthorized = 5,
+}
+
+#[contractevent]
+pub struct PauserChanged {
+    pub pauser: Address,
+}
+
+// Admin-only: set (or rotate) the hot pauser key.
+pub fn set_pauser(env: Env, pauser: Address) -> Result<(), Error> {
+    let admin: Address = /* load admin */;
+    admin.require_auth();
+    compliance_pausable::set_pauser(&env, &pauser);
+    PauserChanged { pauser }.publish(&env);
+    Ok(())
+}
+
+// Anyone can read the current pauser.
+pub fn get_pauser(env: Env) -> Option<Address> {
+    compliance_pausable::get_pauser(&env)
+}
+
+// Pauser-only: halt the contract. Note this does *not* accept the admin.
+pub fn pause(env: Env) -> Result<(), Error> {
+    compliance_pausable::require_pauser(&env, Error::NotAuthorized)?;
+    compliance_pausable::pause(&env);
+    Paused.publish(&env);
+    Ok(())
+}
+
+// Admin-only: resume the contract.
+pub fn unpause(env: Env) -> Result<(), Error> {
+    let admin: Address = /* load admin */;
+    admin.require_auth();
+    compliance_pausable::unpause(&env);
+    Unpaused.publish(&env);
+    Ok(())
+}
+```
+
+`require_pauser()` authorizes the stored pauser address (falling back to
+the admin when no pauser has been set, so existing deployments keep
+working) and returns the caller-supplied error if the check fails. See the
+crate's rustdoc for the exact fallback semantics.
+
+### Migration note
+
+Contracts that previously gated `pause()` on the admin key can adopt the
+pauser role incrementally: leave `set_pauser()` uncalled and
+`require_pauser()` falls back to the admin, preserving current behavior
+until an operator explicitly installs a hot pauser key.
+
 ## Publishing to crates.io
 
 This crate is publish-ready (`description`, `license`, `repository`, and

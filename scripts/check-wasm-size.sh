@@ -65,6 +65,7 @@ get_field() {
 
 fail=0
 failures=()
+report_rows=""
 printf "%-24s %10s %10s %10s  %s\n" "contract" "size" "budget" "limit" "status"
 printf "%-24s %10s %10s %10s  %s\n" "--------" "----" "------" "-----" "------"
 
@@ -76,11 +77,13 @@ for crate in "${BUDGETED_CRATES[@]}"; do
   if [ ! -f "$wasm_path" ]; then
     echo "error: expected build artifact not found at $wasm_path" >&2
     fail=1
+    report_rows+="| \`$crate\` | – | $max_bytes | – | – | FAIL (no artifact) |"$'\n'
     continue
   fi
 
   size="$(stat -c%s "$wasm_path" 2>/dev/null || stat -f%z "$wasm_path")"
   limit="$(awk -v b="$max_bytes" -v t="$TOLERANCE" 'BEGIN { printf "%d", b * t }')"
+  delta="$(awk -v s="$size" -v b="$max_bytes" 'BEGIN { printf "%+d B (%+.1f%%)", s - b, (s - b) * 100 / b }')"
 
   if [ "$size" -gt "$limit" ]; then
     over_limit=$((size - limit))
@@ -93,9 +96,24 @@ for crate in "${BUDGETED_CRATES[@]}"; do
     status="ok"
   fi
   printf "%-24s %10s %10s %10s  %s\n" "$crate" "$size" "$max_bytes" "$limit" "$status"
+  report_rows+="| \`$crate\` | $size | $max_bytes | $delta | $limit | $status |"$'\n'
 done
 
 echo ""
+# Markdown table for the PR comment (posted by the ci.yml step when WASM_SIZE_REPORT is set).
+if [ -n "${WASM_SIZE_REPORT:-}" ]; then
+  {
+    echo "<!-- wasm-size-budget -->"
+    echo "### Wasm size budget"
+    echo ""
+    echo "| Contract | Size (B) | Baseline (B) | Δ vs baseline | Limit (B) | Status |"
+    echo "|---|---:|---:|---:|---:|---|"
+    printf '%s' "$report_rows"
+    echo ""
+    echo "Limit = baseline + 10%. If growth is intentional, update \`max_bytes\` in \`$BUDGETS_FILE\` and explain it in the PR description."
+  } > "$WASM_SIZE_REPORT"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "==> wasm size budget check FAILED"
   for msg in "${failures[@]}"; do

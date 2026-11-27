@@ -1,4 +1,4 @@
-.PHONY: test doctest clippy fmt fmt-check lint build check-wasm-size check-accessibility check-all check-contracterror-discriminants
+.PHONY: test doctest clippy fmt fmt-check lint build check-wasm-size check-accessibility check-all check-contracterror-discriminants test-migration check-errors-docs
 
 # Mirrors the "cargo test" CI job (.github/workflows/ci.yml).
 test:
@@ -19,14 +19,30 @@ fmt-check:
 	cargo fmt --all -- --check
 
 # Full local lint pass: clippy (as run in CI) plus a formatting check.
-lint: clippy fmt-check check-contracterror-discriminants
+lint: clippy fmt-check check-contracterror-discriminants check-errors-docs
 
 check-contracterror-discriminants:
 	python3 scripts/check-contracterror-discriminants.py
 
+# Regenerate docs/ERRORS.md from the Error enums and fail if the committed
+# copy is out of date. Mirrors the "docs/ERRORS.md up to date" CI job.
+check-errors-docs:
+	python3 scripts/generate-errors-docs.py
+	@if [ -n "$$(git status --porcelain docs/ERRORS.md)" ]; then \
+		echo "✗ docs/ERRORS.md is out of date. Run 'make check-errors-docs' and commit."; \
+		git status --porcelain docs/ERRORS.md; \
+		exit 1; \
+	else \
+		echo "✓ docs/ERRORS.md is up to date"; \
+	fi
+
 # Mirrors the "wasm32v1-none build" CI job.
 build:
 	cargo build --workspace --target wasm32v1-none --release
+
+# Builds the last release WASM and HEAD, then verifies state survives upgrade.
+test-migration:
+	bash scripts/test-migration.sh
 
 # Mirrors the "wasm size budget" CI job.
 check-wasm-size:

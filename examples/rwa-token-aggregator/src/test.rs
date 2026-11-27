@@ -46,26 +46,12 @@ fn setup(env: &Env) -> Fixture<'_> {
         &Some(breaker_id.clone()),
     );
 
-    let allowed_codes = vec![
-        env,
-        String::from_str(env, "US"),
-        String::from_str(env, "CA"),
-    ];
+    let allowed_codes = vec![env, String::from_str(env, "US"), String::from_str(env, "CA")];
     let token_id = env.register(RwaAggregatorToken, ());
     let token = RwaAggregatorTokenClient::new(env, &token_id);
     token.initialize(&aggregator_id, &allowed_codes);
 
-    Fixture {
-        gate_admin,
-        issuer,
-        breaker_admin,
-        agg_admin,
-        gate_id,
-        jurisdiction_id,
-        breaker_id,
-        aggregator,
-        token,
-    }
+    Fixture { gate_admin, issuer, breaker_admin, agg_admin, gate_id, jurisdiction_id, breaker_id, aggregator, token }
 }
 
 fn onboard(env: &Env, fx: &Fixture<'_>, who: &Address, code: &str) {
@@ -163,7 +149,7 @@ fn test_frozen_circuit_breaker_halts_transfers_through_aggregator() {
     let fx = setup(&env);
     let (alice, bob) = two_onboarded_parties(&env, &fx);
 
-    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin);
+    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin, &None);
 
     let result = fx.token.try_transfer(&alice, &bob, &400);
     assert_eq!(result, Err(Ok(Error::CircuitBreakerFrozen)));
@@ -182,7 +168,7 @@ fn test_breaker_takes_priority_over_denylist() {
     let fx = setup(&env);
     let (alice, bob) = two_onboarded_parties(&env, &fx);
     DenylistGateClient::new(&env, &fx.gate_id).add_to_denylist(&fx.gate_admin, &alice);
-    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin);
+    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin, &None);
 
     let result = fx.token.try_transfer(&alice, &bob, &400);
     assert_eq!(result, Err(Ok(Error::CircuitBreakerFrozen)));
@@ -194,10 +180,7 @@ fn test_swapping_primitive_in_aggregator_needs_no_token_change() {
     let fx = setup(&env);
     let (alice, bob) = two_onboarded_parties(&env, &fx);
     DenylistGateClient::new(&env, &fx.gate_id).add_to_denylist(&fx.gate_admin, &alice);
-    assert_eq!(
-        fx.token.try_transfer(&alice, &bob, &400),
-        Err(Ok(Error::DeniedByGate))
-    );
+    assert_eq!(fx.token.try_transfer(&alice, &bob, &400), Err(Ok(Error::DeniedByGate)));
 
     // Point the aggregator at a fresh, empty denylist-gate.
     let new_gate_id = env.register(DenylistGate, ());
@@ -214,8 +197,7 @@ fn test_transfer_fails_closed_when_aggregator_has_no_checks() {
     env.mock_all_auths();
     let agg_admin = Address::generate(&env);
     let aggregator_id = env.register(ComplianceAggregator, ());
-    ComplianceAggregatorClient::new(&env, &aggregator_id)
-        .initialize(&agg_admin, &None, &None, &None);
+    ComplianceAggregatorClient::new(&env, &aggregator_id).initialize(&agg_admin, &None, &None, &None);
 
     let token_id = env.register(RwaAggregatorToken, ());
     let token = RwaAggregatorTokenClient::new(&env, &token_id);
@@ -246,18 +228,13 @@ fn test_transfer_rejects_non_positive_amount() {
     let fx = setup(&env);
     let (alice, bob) = two_onboarded_parties(&env, &fx);
 
-    assert_eq!(
-        fx.token.try_transfer(&alice, &bob, &0),
-        Err(Ok(Error::InvalidAmount))
-    );
+    assert_eq!(fx.token.try_transfer(&alice, &bob, &0), Err(Ok(Error::InvalidAmount)));
 }
 
 #[test]
 fn test_double_initialize_fails() {
     let env = Env::default();
     let fx = setup(&env);
-    let result = fx
-        .token
-        .try_initialize(&fx.aggregator.address, &vec![&env, String::from_str(&env, "US")]);
+    let result = fx.token.try_initialize(&fx.aggregator.address, &vec![&env, String::from_str(&env, "US")]);
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
 }

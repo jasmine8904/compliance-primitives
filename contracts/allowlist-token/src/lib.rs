@@ -81,20 +81,24 @@ contractmeta!(key = "source", val = env!("CARGO_PKG_REPOSITORY"));
 
 /// Extend a persistent allowlist entry when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger on mainnet).
-pub(crate) const ALLOWED_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub(crate) const ALLOWED_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 
 /// Target remaining TTL after extension (~90 days at ~5s/ledger).
-pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 /// Maximum number of addresses accepted by a batch allowlist operation.
 pub const MAX_BATCH_SIZE: u32 = 45;
 
+/// Maximum number of sibling hashes accepted in a Merkle allowlist proof.
+/// 32 levels covers 2^32 holders and bounds the hashing cost of one check.
+pub const MAX_MERKLE_PROOF_LEN: u32 = 32;
+
 /// Instance-storage TTL policy: whenever the remaining instance TTL drops
 /// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
 /// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
-pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub const INSTANCE_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 /// Target instance TTL after an extension.
-pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 #[contracttype]
 #[derive(Clone)]
@@ -117,6 +121,22 @@ enum DataKey {
     Frozen(Address),
     /// When `true`, `clawback` only succeeds against a frozen address. Instance storage.
     ClawbackRequiresFreeze,
+    /// Number of addresses currently holding an allowlist entry. Instance storage.
+    AllowlistCount,
+    /// Merkle root of the proof-based allowlist. Instance storage.
+    AllowlistRoot,
+    /// Global maximum balance any single address may hold. Instance storage.
+    GlobalMaxBalance,
+    /// Per-address maximum balance. Persistent storage.
+    MaxBalance(Address),
+    /// Number of addresses currently holding a non-zero balance. Instance storage.
+    HolderCount,
+    /// Optional cap on `HolderCount`. Absent = unlimited. Instance storage.
+    MaxHolders,
+    /// Who approved an allowlist entry and at which ledger. Kept under its own
+    /// key, not inside `AllowlistEntry`, so existing entries keep their stored
+    /// shape. Persistent storage.
+    AllowedProvenance(Address),
 }
 
 #[contracttype]
@@ -125,16 +145,40 @@ pub struct AllowlistEntry {
     pub expiration_ledger: Option<u32>,
 }
 
+/// Approval record for an allowlist entry: the admin that approved it and the
+/// ledger it was approved at. Stored under `DataKey::AllowedProvenance`.
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowlistProvenance {
+    pub added_by: Address,
+    pub added_at_ledger: u32,
+}
+
+/// Allowlist entry as returned by `get_allowlist_entry`: the stored expiry
+/// plus approval provenance. `added_by` and `added_at_ledger` are `None` for
+/// entries approved before provenance was recorded.
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowlistEntryInfo {
+    pub expiration_ledger: Option<u32>,
+    pub added_by: Option<Address>,
+    pub added_at_ledger: Option<u32>,
+}
+
 #[contractevent]
 pub struct AllowAdd {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 #[contractevent]
 pub struct AllowRemove {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted when an admin or compliance officer freezes `address`.
@@ -241,6 +285,25 @@ pub struct DelegatedAdminKeySet {
     pub pubkey: BytesN<32>,
 }
 
+/// Emitted when a max-balance limit changes. `address` is `None` for the
+/// global limit and `Some(holder)` for a per-address limit. `limit` is `None`
+/// when the limit is removed.
+#[contractevent]
+pub struct MaxBalanceSet {
+    #[topic]
+    pub admin: Address,
+    pub address: Option<Address>,
+    pub limit: Option<i128>,
+}
+
+/// Emitted when `set_allowlist_root` publishes a new proof-mode allowlist root.
+#[contractevent]
+pub struct AllowlistRootSet {
+    #[topic]
+    pub admin: Address,
+    pub root: BytesN<32>,
+}
+
 #[contractevent]
 pub struct Paused {
     #[topic]
@@ -327,6 +390,11 @@ pub enum Error {
     /// `clawback` was called against an address that is not frozen while
     /// `clawback_requires_freeze` is enabled.
     ClawbackRequiresFreeze = 15,
+    /// A transfer would leave the recipient above the global or per-address
+    /// maximum balance.
+    MaxBalanceExceeded = 16,
+    /// A transfer would add a new holder beyond the configured `MaxHolders`.
+    MaxHoldersReached = 17,
 }
 
 #[contract]
@@ -412,6 +480,15 @@ impl AllowlistToken {
     /// it is restricted to the `admin` (directly, or through
     /// `add_to_allowlist_delegated`). The compliance officer may revoke access
     /// via `remove_from_allowlist` but never grant it.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `token` is an `AllowlistTokenClient` for the deployed contract.
+    /// // Grant `alice` access until ledger `expiry`; `None` means no expiry.
+    /// token.add_to_allowlist(&admin, &alice, &Some(expiry));
+    /// token.add_to_allowlist(&admin, &bob, &None);
+    /// ```
     pub fn add_to_allowlist(
         env: Env,
         admin: Address,
@@ -424,17 +501,25 @@ impl AllowlistToken {
                 return Err(Error::InvalidInput);
             }
         }
-        let key = DataKey::Allowed(address.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &AllowlistEntry { expiration_ledger });
-        env.storage().persistent().extend_ttl(
-            &key,
-            ALLOWED_TTL_THRESHOLD,
-            ALLOWED_TTL_EXTEND_TO,
-        );
-        AllowAdd { address }.publish(&env);
+        Self::write_allowlist_entry(&env, &address, expiration_ledger, &admin);
+        AllowAdd { address, by: admin }.publish(&env);
         Ok(())
+    }
+
+    /// Allowlist `address` until ledger `valid_until` (inclusive), for KYC or
+    /// onboarding approvals that expire. Admin-only.
+    ///
+    /// The expiry is stored on the entry. `is_allowed` and transfers treat the
+    /// address as allowlisted through ledger `valid_until` and as not
+    /// allowlisted from ledger `valid_until + 1` onward. Returns
+    /// `Err(InvalidInput)` if `valid_until` is already in the past.
+    pub fn add_to_allowlist_until(
+        env: Env,
+        admin: Address,
+        address: Address,
+        valid_until: u32,
+    ) -> Result<(), Error> {
+        Self::add_to_allowlist(env, admin, address, Some(valid_until))
     }
 
     /// Add every address to the allowlist. Admin-only; each entry receives the
@@ -456,16 +541,8 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            let key = DataKey::Allowed(address.clone());
-            env.storage()
-                .persistent()
-                .set(&key, &AllowlistEntry { expiration_ledger });
-            env.storage().persistent().extend_ttl(
-                &key,
-                ALLOWED_TTL_THRESHOLD,
-                ALLOWED_TTL_EXTEND_TO,
-            );
-            AllowAdd { address }.publish(&env);
+            Self::write_allowlist_entry(&env, &address, expiration_ledger, &admin);
+            AllowAdd { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
     }
@@ -533,34 +610,29 @@ impl AllowlistToken {
             Ok(_) => {}
             Err(_) => return Err(Error::NotAuthorized),
         }
-        let key = DataKey::Allowed(address.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &AllowlistEntry { expiration_ledger: None });
-        env.storage().persistent().extend_ttl(
-            &key,
-            ALLOWED_TTL_THRESHOLD,
-            ALLOWED_TTL_EXTEND_TO,
-        );
-        AllowAdd { address }.publish(&env);
+        Self::write_allowlist_entry(&env, &address, None, &admin);
+        AllowAdd { address, by: admin }.publish(&env);
         Ok(())
     }
 
     /// Remove `address` from the allowlist. Admin or compliance officer.
     ///
+    /// If `address` is not allowlisted this is a silent no-op: no storage
+    /// write happens and no `AllowRemove` event is emitted, so event streams
+    /// only ever record real state changes.
+    ///
     /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Allowed(address.clone()));
-        AllowRemove { address }.publish(&env);
+        Self::remove_allowed_if_present(&env, address, &admin);
         Ok(())
     }
 
     /// Remove every address from the allowlist. Admin or compliance officer;
-    /// each address emits an individual `AllowRemove` event.
+    /// each address that was actually allowlisted emits an individual
+    /// `AllowRemove` event. Addresses that are not allowlisted are skipped
+    /// with no write and no event, matching `remove_from_allowlist`.
     ///
     /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn remove_multiple_from_allowlist(
@@ -575,10 +647,7 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Allowed(address.clone()));
-            AllowRemove { address }.publish(&env);
+            Self::remove_allowed_if_present(&env, address, &admin);
         }
         Ok(())
     }
@@ -660,8 +729,49 @@ impl AllowlistToken {
             .instance()
             .get(&DataKey::Token)
             .ok_or(Error::NotInitialized)?;
+        let token_client = token::Client::new(&env, &token_address);
+        let from_before = token_client.balance(&from);
         token::StellarAssetClient::new(&env, &token_address).clawback(&from, &amount);
+        if from_before == amount {
+            // `from` held exactly the clawed-back amount, so it is no longer a holder.
+            let count = Self::read_holder_count(&env);
+            env.storage()
+                .instance()
+                .set(&DataKey::HolderCount, &count.saturating_sub(1));
+        }
         Clawback { admin, from, amount }.publish(&env);
+        Ok(())
+    }
+
+    /// Number of addresses currently holding a non-zero balance of the wrapped
+    /// token, as tracked by this contract.
+    ///
+    /// The counter follows movements made through `transfer` and `clawback`.
+    /// Balances that change through any other path (for example direct transfers
+    /// on the underlying token, or pre-existing balances from before deployment)
+    /// are not reflected.
+    pub fn holder_count(env: Env) -> u32 {
+        Self::read_holder_count(&env)
+    }
+
+    /// Returns the configured holder cap, or `None` if unlimited.
+    pub fn get_max_holders(env: Env) -> Option<u32> {
+        Self::read_max_holders(&env)
+    }
+
+    /// Set (`Some(max)`) or clear (`None`) the cap on holders. Admin-only.
+    ///
+    /// Once set, a `transfer` that would move tokens to an address without a
+    /// balance is rejected with `MaxHoldersReached` if it would push
+    /// `holder_count` above `max`. Transfers between existing holders are never
+    /// blocked by the cap. Lowering the cap below the current count does not
+    /// remove holders; it only blocks new ones until the count falls.
+    pub fn set_max_holders(env: Env, admin: Address, max: Option<u32>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        match max {
+            Some(max) => env.storage().instance().set(&DataKey::MaxHolders, &max),
+            None => env.storage().instance().remove(&DataKey::MaxHolders),
+        }
         Ok(())
     }
 
@@ -897,21 +1007,210 @@ impl AllowlistToken {
             env.storage().persistent().get(&DataKey::Allowed(address));
         match entry {
             None => false,
-            Some(AllowlistEntry {
-                expiration_ledger: None,
-            }) => true,
-            Some(AllowlistEntry {
-                expiration_ledger: Some(exp),
-            }) => env.ledger().sequence() <= exp,
+            Some(entry) => Self::entry_is_active(&env, &entry),
         }
     }
 
-    /// Returns the raw allowlist entry stored for `address`, if any.
+    /// Batch form of [`is_allowed`]: returns one `bool` per input address, in
+    /// the same order. Accepts at most [`MAX_BATCH_SIZE`] addresses and
+    /// returns `Err(BatchTooLarge)` otherwise, so integrators can check many
+    /// holders in a single call.
     ///
+    /// Not affected by pause state — reads always succeed. Like `is_allowed`,
+    /// it does not extend entry TTLs.
+    pub fn is_allowed_batch(env: Env, addresses: Vec<Address>) -> Result<Vec<bool>, Error> {
+        if addresses.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut results = Vec::new(&env);
+        for address in addresses.iter() {
+            results.push_back(Self::is_allowed(env.clone(), address));
+        }
+        Ok(results)
+    }
+
+    /// Returns the allowlist entry for `address`, if any, including who
+    /// approved it (`added_by`) and at which ledger (`added_at_ledger`).
+    ///
+    /// Provenance is `None` for entries approved before it was recorded.
     /// An already-expired entry is still returned here (it is only ignored,
     /// not deleted) — use `is_allowed` for the effective status.
-    pub fn get_allowlist_entry(env: Env, address: Address) -> Option<AllowlistEntry> {
-        env.storage().persistent().get(&DataKey::Allowed(address))
+    pub fn get_allowlist_entry(env: Env, address: Address) -> Option<AllowlistEntryInfo> {
+        let entry: AllowlistEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowed(address.clone()))?;
+        let provenance: Option<AllowlistProvenance> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowedProvenance(address));
+        Some(AllowlistEntryInfo {
+            expiration_ledger: entry.expiration_ledger,
+            added_by: provenance.as_ref().map(|p| p.added_by.clone()),
+            added_at_ledger: provenance.map(|p| p.added_at_ledger),
+        })
+    }
+
+    /// Number of addresses that currently hold an allowlist entry.
+    ///
+    /// Maintained incrementally: it changes only when an add creates a new
+    /// entry or a remove deletes an existing one. Re-adding an address (for
+    /// example to change its expiration) and removing an address that is not
+    /// listed leave it unchanged. Like `get_allowlist_entry`, it counts stored
+    /// entries whether or not they have expired; use `is_allowed` for the
+    /// effective status of one address.
+    pub fn allowlist_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0)
+    }
+
+    /// Set or clear the global maximum balance any single address may hold.
+    /// Admin-only. `None` removes the limit. Negative limits are rejected
+    /// with `InvalidInput`.
+    ///
+    /// Enforced on the recipient of `transfer` and `transfer_with_proof`
+    /// (see `MaxBalanceExceeded`). Emits `MaxBalanceSet`.
+    pub fn set_global_max_balance(env: Env, admin: Address, limit: Option<i128>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::validate_limit(limit)?;
+        match limit {
+            Some(limit) => env
+                .storage()
+                .instance()
+                .set(&DataKey::GlobalMaxBalance, &limit),
+            None => env.storage().instance().remove(&DataKey::GlobalMaxBalance),
+        }
+        MaxBalanceSet {
+            admin,
+            address: None,
+            limit,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Set or clear the maximum balance for one address. Admin-only. `None`
+    /// removes the per-address limit. Negative limits are rejected with
+    /// `InvalidInput`.
+    ///
+    /// When both a global and a per-address limit apply, the stricter one is
+    /// enforced. Emits `MaxBalanceSet`.
+    pub fn set_address_max_balance(
+        env: Env,
+        admin: Address,
+        address: Address,
+        limit: Option<i128>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::validate_limit(limit)?;
+        let key = DataKey::MaxBalance(address.clone());
+        match limit {
+            Some(limit) => {
+                env.storage().persistent().set(&key, &limit);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, ALLOWED_TTL_THRESHOLD, ALLOWED_TTL_EXTEND_TO);
+            }
+            None => env.storage().persistent().remove(&key),
+        }
+        MaxBalanceSet {
+            admin,
+            address: Some(address),
+            limit,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the global maximum balance, if one is set.
+    pub fn get_global_max_balance(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::GlobalMaxBalance)
+    }
+
+    /// Returns the per-address maximum balance for `address`, if one is set.
+    pub fn get_address_max_balance(env: Env, address: Address) -> Option<i128> {
+        env.storage().persistent().get(&DataKey::MaxBalance(address))
+    }
+
+    /// Publish the Merkle root of the proof-based allowlist. Admin-only.
+    ///
+    /// Proof mode lets an issuer authorize a large holder set with one
+    /// on-chain value. Holders prove membership with [`is_allowed_with_proof`]
+    /// or [`transfer_with_proof`]. The root must be built with the leaf and
+    /// node encoding in `docs/allowlist-merkle-root.md`.
+    ///
+    /// Proof mode has no per-address expiration and no per-address revocation:
+    /// to remove a holder, publish a new root that omits them. Replacing the
+    /// root does not touch on-chain entries used by `is_allowed` / `transfer`.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is paused.
+    /// Emits `AllowlistRootSet { admin, root }`.
+    pub fn set_allowlist_root(env: Env, admin: Address, root: BytesN<32>) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AllowlistRoot, &root);
+        AllowlistRootSet { admin, root }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns the current proof-mode allowlist root, if one has been set.
+    pub fn get_allowlist_root(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::AllowlistRoot)
+    }
+
+    /// Returns true if `proof` shows that `address` is a leaf under the
+    /// current allowlist root.
+    ///
+    /// Returns false when no root is set, when `proof` has more than
+    /// [`MAX_MERKLE_PROOF_LEN`] entries, or when the proof does not rebuild
+    /// the root. Not affected by pause state, and does not check freeze
+    /// status (see `is_frozen`).
+    pub fn is_allowed_with_proof(env: Env, address: Address, proof: Vec<BytesN<32>>) -> bool {
+        Self::verify_allowlist_proof(&env, &address, &proof)
+    }
+
+    /// Proof-mode counterpart of [`transfer`]. Each party proves membership
+    /// under the current root instead of using the on-chain allowlist.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is paused, and
+    /// `Err(AddressFrozen)` if either party is frozen. Returns `Ok(false)`
+    /// without forwarding if either proof fails, emitting `Blocked`. Otherwise
+    /// forwards the transfer to the underlying token and returns `Ok(true)`.
+    pub fn transfer_with_proof(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+        from_proof: Vec<BytesN<32>>,
+        to_proof: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        Self::extend_instance_ttl(&env);
+        if amount < 0 {
+            return Err(Error::InvalidInput);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::ContractPaused);
+        }
+        from.require_auth();
+        if Self::is_frozen_internal(&env, &from) || Self::is_frozen_internal(&env, &to) {
+            return Err(Error::AddressFrozen);
+        }
+        if !Self::verify_allowlist_proof(&env, &from, &from_proof)
+            || !Self::verify_allowlist_proof(&env, &to, &to_proof)
+        {
+            Blocked { from, to, amount }.publish(&env);
+            return Ok(false);
+        }
+        Self::enforce_max_balance(&env, &to, amount)?;
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        token::Client::new(&env, &token_address).transfer(&from, &to, &amount);
+        Ok(true)
     }
 
     /// Version of the shared `ComplianceCheck` interface implemented by this
@@ -1045,6 +1344,7 @@ impl AllowlistToken {
             Blocked { from, to, amount }.publish(&env);
             return Ok(false);
         }
+        Self::enforce_max_balance(&env, &to, amount)?;
 
         let token_address: Address = env
             .storage()
@@ -1052,7 +1352,25 @@ impl AllowlistToken {
             .get(&DataKey::Token)
             .ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_address);
+
+        // Holder accounting: read balances before and after the move so the
+        // counter reflects 0 -> non-zero and non-zero -> 0 transitions.
+        let from_before = token_client.balance(&from);
+        let to_before = token_client.balance(&to);
+        let (leaves, joins) =
+            Self::holder_transition(&from, &to, amount, from_before, to_before);
+        let count = Self::read_holder_count(&env);
+        let new_count = count.saturating_add(joins as u32).saturating_sub(leaves as u32);
+        if joins {
+            if let Some(max) = Self::read_max_holders(&env) {
+                if new_count > max {
+                    return Err(Error::MaxHoldersReached);
+                }
+            }
+        }
+
         token_client.transfer(&from, &to, &amount);
+        env.storage().instance().set(&DataKey::HolderCount, &new_count);
         Ok(true)
     }
 
@@ -1104,6 +1422,117 @@ impl AllowlistToken {
         Err(Error::NotAuthorized)
     }
 
+    /// Stores `entry` for `address` and extends its TTL. `AllowlistCount` is
+    /// incremented only when the address had no stored entry before, so
+    /// updating an existing entry leaves the count unchanged.
+    fn store_allowlist_entry(env: &Env, address: &Address, entry: AllowlistEntry) {
+        let key = DataKey::Allowed(address.clone());
+        let is_new = !env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ALLOWED_TTL_THRESHOLD, ALLOWED_TTL_EXTEND_TO);
+        if is_new {
+            Self::adjust_allowlist_count(env, 1);
+        }
+    }
+
+    /// Deletes `address`'s allowlist entry. `AllowlistCount` is decremented
+    /// only when an entry was actually present.
+    fn remove_allowlist_entry(env: &Env, address: &Address) {
+        let key = DataKey::Allowed(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            Self::adjust_allowlist_count(env, -1);
+        }
+    }
+
+    fn adjust_allowlist_count(env: &Env, delta: i64) {
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0);
+        let updated = (i64::from(current) + delta).max(0) as u32;
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &updated);
+    }
+
+    fn validate_limit(limit: Option<i128>) -> Result<(), Error> {
+        match limit {
+            Some(value) if value < 0 => Err(Error::InvalidInput),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rejects a transfer that would leave `to` above its effective maximum
+    /// balance: the stricter of the global limit and `to`'s own limit, using
+    /// whichever are set. Does nothing when neither is set.
+    fn enforce_max_balance(env: &Env, to: &Address, amount: i128) -> Result<(), Error> {
+        let global: Option<i128> = env.storage().instance().get(&DataKey::GlobalMaxBalance);
+        let per_address: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxBalance(to.clone()));
+        let limit = match (global, per_address) {
+            (None, None) => return Ok(()),
+            (Some(limit), None) | (None, Some(limit)) => limit,
+            (Some(global), Some(own)) => global.min(own),
+        };
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        let current = token::Client::new(env, &token_address).balance(to);
+        let projected = current.checked_add(amount).ok_or(Error::InvalidInput)?;
+        if projected > limit {
+            return Err(Error::MaxBalanceExceeded);
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the root from `address`'s leaf and the supplied siblings and
+    /// compares it with the stored root.
+    fn verify_allowlist_proof(env: &Env, address: &Address, proof: &Vec<BytesN<32>>) -> bool {
+        let root: BytesN<32> = match env.storage().instance().get(&DataKey::AllowlistRoot) {
+            Some(root) => root,
+            None => return false,
+        };
+        if proof.len() > MAX_MERKLE_PROOF_LEN {
+            return false;
+        }
+        let mut node = Self::merkle_leaf_hash(env, address);
+        for sibling in proof.iter() {
+            node = Self::merkle_node_hash(env, &node, &sibling);
+        }
+        node == root
+    }
+
+    /// Leaf hash: `sha256(0x00 || address_strkey)`. The `0x00` prefix keeps
+    /// leaves and internal nodes in separate domains.
+    fn merkle_leaf_hash(env: &Env, address: &Address) -> BytesN<32> {
+        let address_str = address.to_string().to_string();
+        let mut preimage = Bytes::from_slice(env, &[0x00]);
+        preimage.append(&Bytes::from_slice(env, address_str.as_bytes()));
+        env.crypto().sha256(&preimage).to_bytes()
+    }
+
+    /// Internal node hash: `sha256(0x01 || min(a, b) || max(a, b))`. Sorting
+    /// the pair makes proofs independent of left/right position.
+    fn merkle_node_hash(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
+        let (lo, hi) = if a.to_array() <= b.to_array() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let mut preimage = Bytes::from_slice(env, &[0x01]);
+        preimage.append(&Bytes::from_slice(env, &lo.to_array()));
+        preimage.append(&Bytes::from_slice(env, &hi.to_array()));
+        env.crypto().sha256(&preimage).to_bytes()
+    }
+
     fn is_frozen_internal(env: &Env, address: &Address) -> bool {
         env.storage()
             .persistent()
@@ -1111,17 +1540,103 @@ impl AllowlistToken {
             .unwrap_or(false)
     }
 
-    fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {
-        let key = DataKey::Allowed(address);
-        let allowed = env.storage().persistent().get(&key).unwrap_or(false);
-        if allowed {
-            env.storage().persistent().extend_ttl(
-                &key,
-                ALLOWED_TTL_THRESHOLD,
-                ALLOWED_TTL_EXTEND_TO,
-            );
+    /// An entry is active unless it has an expiration ledger that is already
+    /// in the past (`current sequence > expiration_ledger`).
+    fn entry_is_active(env: &Env, entry: &AllowlistEntry) -> bool {
+        match entry.expiration_ledger {
+            None => true,
+            Some(exp) => env.ledger().sequence() <= exp,
         }
-        Err(Error::NotAuthorized)
+    }
+
+    /// Returns whether `address` has an active (non-expired) allowlist entry.
+    /// Refreshes the entry's TTL when it is active.
+    fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {
+        let address_for_provenance = address.clone();
+        let key = DataKey::Allowed(address);
+        let entry: Option<AllowlistEntry> = env.storage().persistent().get(&key);
+        match entry {
+            Some(entry) if Self::entry_is_active(env, &entry) => {
+                Self::extend_allowed_ttl(env, &key);
+                let provenance_key = DataKey::AllowedProvenance(address_for_provenance);
+                if env.storage().persistent().has(&provenance_key) {
+                    Self::extend_allowed_ttl(env, &provenance_key);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Writes the allowlist entry and its provenance, then extends both TTLs.
+    fn write_allowlist_entry(
+        env: &Env,
+        address: &Address,
+        expiration_ledger: Option<u32>,
+        added_by: &Address,
+    ) {
+        let key = DataKey::Allowed(address.clone());
+        Self::store_allowlist_entry(env, address, AllowlistEntry { expiration_ledger });
+        let provenance_key = DataKey::AllowedProvenance(address.clone());
+        env.storage().persistent().set(
+            &provenance_key,
+            &AllowlistProvenance {
+                added_by: added_by.clone(),
+                added_at_ledger: env.ledger().sequence(),
+            },
+        );
+        Self::extend_allowed_ttl(env, &key);
+        Self::extend_allowed_ttl(env, &provenance_key);
+    }
+
+    fn extend_allowed_ttl(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, ALLOWED_TTL_THRESHOLD, ALLOWED_TTL_EXTEND_TO);
+    }
+
+    /// Removes the allowlist entry for `address` and emits `AllowRemove`, but
+    /// only if an entry exists. Absent addresses are left untouched.
+    fn remove_allowed_if_present(env: &Env, address: Address, by: &Address) {
+        let key = DataKey::Allowed(address.clone());
+        if env.storage().persistent().has(&key) {
+            Self::remove_allowlist_entry(env, &address);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AllowedProvenance(address.clone()));
+            AllowRemove {
+                address,
+                by: by.clone(),
+            }
+            .publish(env);
+        }
+    }
+
+    fn read_holder_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::HolderCount)
+            .unwrap_or(0)
+    }
+
+    fn read_max_holders(env: &Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::MaxHolders)
+    }
+
+    /// Returns `(leaves, joins)`: whether `from` ends the move with a zero balance
+    /// and whether `to` starts the move with a zero balance. A self-transfer or a
+    /// zero-amount move changes no holder.
+    fn holder_transition(
+        from: &Address,
+        to: &Address,
+        amount: i128,
+        from_before: i128,
+        to_before: i128,
+    ) -> (bool, bool) {
+        if amount <= 0 || from == to {
+            return (false, false);
+        }
+        (from_before == amount, to_before == 0)
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {

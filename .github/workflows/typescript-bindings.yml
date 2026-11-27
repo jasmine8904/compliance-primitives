@@ -1,0 +1,82 @@
+name: TypeScript Bindings
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  generate-bindings:
+    name: Generate TypeScript bindings
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install stellar CLI
+        run: cargo install --locked stellar-cli
+
+      - name: Build all contracts
+        run: stellar contract build
+
+      - name: Generate TypeScript bindings
+        run: |
+          mkdir -p bindings
+          for contract in \
+            allowlist-token \
+            audit-log \
+            circuit-breaker \
+            compliance-aggregator \
+            compliance-check \
+            denylist-gate \
+            jurisdiction-flag \
+            multisig-admin \
+            pausable \
+            policy-engine; do
+
+            wasm_name="${contract//-/_}.wasm"
+            wasm_path="target/wasm32v1-none/release/${wasm_name}"
+
+            if [ ! -f "$wasm_path" ]; then
+              echo "warning: $wasm_path not found, skipping $contract" >&2
+              continue
+            fi
+
+            echo "==> Generating bindings for $contract"
+            stellar contract bindings typescript \
+              --wasm "$wasm_path" \
+              --contract-id "PLACEHOLDER_${contract}" \
+              --network testnet \
+              --output-dir "bindings/${contract}" \
+              --overwrite
+          done
+
+      - name: Set release version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack binding tarballs
+        run: |
+          cd bindings
+          for dir in */; do
+            contract="${dir%/}"
+            tar -czf "../${contract}-bindings-${{ steps.version.outputs.version }}.tar.gz" "$contract"
+          done
+          cd ..
+
+      - name: Attach bindings to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*-bindings-*.tar.gz"

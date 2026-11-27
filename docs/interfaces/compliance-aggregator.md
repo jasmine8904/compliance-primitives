@@ -1,6 +1,7 @@
 # compliance-aggregator
 
-A composition point for evaluating multiple compliance primitives as one decision.
+A composition point for evaluating multiple compliance primitives as one
+AND-composed decision.
 
 | Method | Purpose |
 | --- | --- |

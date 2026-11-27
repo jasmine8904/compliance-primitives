@@ -21,7 +21,7 @@ Before acting, determine which contracts the compromised key controls:
 | `jurisdiction-flag` issuer | Can set/remove jurisdiction codes, pause/unpause, upgrade contract |
 | `circuit-breaker` admin | Can freeze/unfreeze, add/remove guardians, propose/accept new admin |
 | `circuit-breaker` guardian | Can freeze only (cannot unfreeze) |
-| `compliance-aggregator` admin | Can reconfigure which gate/flag/breaker contracts are consulted |
+| `compliance-aggregator` admin | Can reconfigure which denylist, jurisdiction, allowlist, and breaker contracts are consulted |
 | `policy-engine` admin | Can add/remove registered checks, set circuit-breaker, upgrade |
 | `multisig-admin` signer | One signer in an M-of-N set; alone cannot act below threshold |
 
@@ -209,11 +209,11 @@ implementation.
 
 **Preferred recovery path**:
 1. Rotate admin via `set_admin` if not yet overwritten.
-2. Audit whether the attacker reconfigured the registered gate/flag/breaker
-   addresses (check `DenylistGateSet`, `JurisdictionFlagSet`,
-   `CircuitBreakerSet` events).
+2. Audit the configured denylist, jurisdiction, breaker, and allowlist
+   addresses using `get_config` and the configuration events.
 3. Restore correct contract addresses via `set_denylist_gate`,
-   `set_jurisdiction_flag`, `set_circuit_breaker`.
+   `set_jurisdiction_flag`, `set_circuit_breaker`, and `set_allowlist` as
+   applicable.
 
 **If admin is overwritten**:
 - Full redeploy required.  See §3.

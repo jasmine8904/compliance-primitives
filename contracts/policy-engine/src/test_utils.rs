@@ -26,6 +26,37 @@ impl MockDenylist {
             .get::<Address, bool>(&address)
             .unwrap_or(false)
     }
+
+    /// Set an optional amount limit for `address`.
+    ///
+    /// When set, `check_with_amount` returns `false` for any transfer whose
+    /// amount exceeds the stored limit.
+    pub fn set_amount_limit(env: Env, address: Address, limit: i128) {
+        env.storage().persistent().set(&(address, "limit"), &limit);
+    }
+
+    /// Amount-aware variant of `check`.
+    ///
+    /// Returns `true` iff the address is NOT denied and, if an amount limit is
+    /// configured for it, `amount` does not exceed that limit.
+    pub fn check_with_amount(env: Env, address: Address, amount: i128) -> bool {
+        if env
+            .storage()
+            .persistent()
+            .get::<Address, bool>(&address)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        match env
+            .storage()
+            .persistent()
+            .get::<(Address, &str), i128>(&(address, "limit"))
+        {
+            Some(limit) => amount <= limit,
+            None => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +92,19 @@ impl MockJurisdiction {
             None => false,
         }
     }
+
+    /// Amount-aware variant of `is_permitted_jurisdiction`.
+    ///
+    /// The amount is accepted for interface compatibility; jurisdiction
+    /// decisions here do not depend on it.
+    pub fn is_permitted_jurisdiction_with_amount(
+        env: Env,
+        address: Address,
+        allowed_codes: Vec<String>,
+        _amount: i128,
+    ) -> bool {
+        Self::is_permitted_jurisdiction(env, address, allowed_codes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,5 +135,13 @@ impl MockCircuitBreaker {
             .instance()
             .get::<bool, bool>(&true)
             .unwrap_or(false)
+    }
+
+    /// Amount-aware variant of `is_frozen`.
+    ///
+    /// The amount is accepted for interface compatibility; the frozen state
+    /// does not depend on it.
+    pub fn is_frozen_with_amount(env: Env, _amount: i128) -> bool {
+        Self::is_frozen(env)
     }
 }

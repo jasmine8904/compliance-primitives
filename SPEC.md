@@ -540,21 +540,21 @@ Provide a single, shared, admin-controlled emergency stop (`freeze`/`unfreeze`/`
 
 ### 6.1 Purpose
 
-Reduce a consumer's cross-contract call overhead by batching a `denylist-gate` check and a `jurisdiction-flag` check into one call (`check_address`/`check_all`), AND-composing the results with a per-check breakdown for auditability. See [`ARCHITECTURE.md`](ARCHITECTURE.md#composition-contracts) for how this relates to `policy-engine`.
+Reduce a consumer's cross-contract call overhead by batching configured `denylist-gate`, `jurisdiction-flag`, `allowlist-token`, and `circuit-breaker` checks into one call (`check_address`/`check_all`), AND-composing the results with a per-check breakdown. Verbose variants expose failure details without changing the existing boolean API shapes. See [`ARCHITECTURE.md`](ARCHITECTURE.md#composition-contracts) for how this relates to `policy-engine`.
 
 ### 6.2 Security Assumptions
 
-- **Admin key is secure**: governs which `denylist-gate`/`jurisdiction-flag` addresses are trusted.
-- **Registered addresses are the real primitives**: this contract does not verify that the registered `DenylistGate`/`JurisdictionFlag` addresses are genuine deployments of those contracts — a malicious or misconfigured address registered by a compromised/careless admin would have its (possibly permissive) response trusted as-is.
+- **Admin key is secure**: governs which denylist, jurisdiction, allowlist, and circuit-breaker addresses are trusted.
+- **Registered addresses are the real primitives**: this contract does not verify that registered addresses are genuine deployments of the expected contracts — a malicious or misconfigured address registered by a compromised/careless admin would have its (possibly permissive) response trusted as-is.
 - **Checks are AND-only**: there is no OR mode here (see `policy-engine` for that). A consumer that needs OR semantics must use a different contract.
-- **Both checks are optional but at least one must be registered**: calling `check_address`/`check_all` with zero registered checks is treated as a misconfiguration, not a vacuous pass.
+- **Checks are optional but at least one must be registered**: calling `check_address`/`check_all` with zero registered checks is treated as a misconfiguration, not a vacuous pass.
 
 ### 6.3 Invariants
 
 #### Invariant 6.3.1: `check_address` AND-Composes All Registered Checks
-**Statement**: `check_address(address, codes)` returns `all_passed = true` iff every registered check (denylist, jurisdiction, or both — whichever are configured) returns `true` for `address`.
+**Statement**: `check_address(address, codes)` returns `all_passed = true` iff every configured check returns `true` for `address`.
 
-**Proof**: `src/lib.rs:273-316` initializes `all_passed = true` and only ever narrows it with `all_passed && passed` per registered check (`src/lib.rs:289`, `304`); it is never widened back to `true`.
+**Proof**: `check_address` initializes `all_passed = true` and combines each configured check's result using logical AND; it is never widened back to `true`.
 
 **Tests verifying this invariant**:
 - `contracts/compliance-aggregator/src/test.rs:test_both_checks_pass`
@@ -563,18 +563,18 @@ Reduce a consumer's cross-contract call overhead by batching a `denylist-gate` c
 - `contracts/compliance-aggregator/src/test.rs:test_both_checks_fail`
 
 #### Invariant 6.3.2: Unregistered Check Types Are Skipped, Not Failed
-**Statement**: If only one of `DenylistGate`/`JurisdictionFlag` is registered, `check_address` evaluates only that one check and does not treat the unregistered check type as a failure.
+**Statement**: An unconfigured check source is skipped and does not count as a failure.
 
-**Proof**: Each check block (`src/lib.rs:282-294`, `297-309`) is gated by `if let Some(addr) = ...`; when the address is absent, the block is skipped entirely rather than contributing a `false` result.
+**Proof**: Each optional check runs only when its address is registered; absent sources are skipped rather than contributing a `false` result.
 
 **Tests verifying this invariant**:
 - `contracts/compliance-aggregator/src/test.rs:test_check_address_denylist_only_pass`
 - `contracts/compliance-aggregator/src/test.rs:test_check_address_jurisdiction_only_pass`
 
 #### Invariant 6.3.3: Zero Registered Checks Is Rejected, Not Vacuously Passed
-**Statement**: `check_address`/`check_all` return `Error::NoChecksRegistered` if neither `DenylistGate` nor `JurisdictionFlag` is registered, rather than returning `all_passed = true` with an empty result list.
+**Statement**: `check_address`/`check_all` return `Error::NoChecksRegistered` if no check source is registered, rather than returning `all_passed = true` with an empty result list.
 
-**Proof**: `check_address` (`src/lib.rs:311-313`) checks `results.is_empty()` after both optional blocks and errors before returning. `check_all` (`src/lib.rs:351-353`) checks both addresses are `None` up front.
+**Proof**: `check_address` rejects an empty result list, and `check_all` checks whether any source is configured before evaluating addresses.
 
 **Tests verifying this invariant**:
 - `contracts/compliance-aggregator/src/test.rs:test_check_address_no_checks_registered`
@@ -589,31 +589,39 @@ Reduce a consumer's cross-contract call overhead by batching a `denylist-gate` c
 - `contracts/compliance-aggregator/src/test.rs:test_check_all_empty_list_error`
 
 #### Invariant 6.3.5: Only Admin Can Register or Replace Check Addresses
-**Statement**: `set_denylist_gate`, `set_jurisdiction_flag`, and `set_admin` all fail for a non-admin caller.
+**Statement**: Check-source configuration methods and `set_admin` fail for a non-admin caller.
 
-**Proof**: All three call `Self::require_admin()` (`src/lib.rs:396-407`) before any storage write, same pattern as Invariant 1.3.3.
+**Proof**: Each configuration method and `set_admin` calls `Self::require_admin()` before writing storage.
 
 **Tests verifying this invariant**:
 - `contracts/compliance-aggregator/src/test.rs:test_set_admin_rejects_non_admin`
 - `contracts/compliance-aggregator/src/test.rs:test_set_denylist_gate_rejects_non_admin`
 - `contracts/compliance-aggregator/src/test.rs:test_set_jurisdiction_flag_rejects_non_admin`
+- `contracts/compliance-aggregator/src/test.rs:test_set_allowlist_rejects_non_admin`
 
 #### Invariant 6.3.6: `check_all` Preserves Per-Address Order and Per-Check Order
-**Statement**: The `Vec<AddressCheckResult>` returned by `check_all` is in the same order as the input `addresses`, and within each result, `checks` lists denylist before jurisdiction (when both are registered).
+**Statement**: The `Vec<AddressCheckResult>` returned by `check_all` is in the same order as the input `addresses`, with per-address checks in the contract's documented evaluation order.
 
-**Proof**: `src/lib.rs:357-387` iterates `addresses.iter()` and pushes to `batch` in order; within each iteration, the denylist block (`361-369`) always runs before the jurisdiction block (`371-380`).
+**Proof**: `check_all` iterates addresses in input order and appends each result in that order. Checks run deterministically as breaker, denylist, jurisdiction, then allowlist.
 
 **Tests verifying this invariant**:
 - `contracts/compliance-aggregator/src/test.rs:test_check_all_mixed_results`
 
+#### Invariant 6.3.7: Verbose Checks Identify the First Failure
+**Statement**: `check_address_verbose` and `check_all_verbose` preserve the pass/fail results and identify the first failing source and reason code, while `check_address` and `check_all` keep their existing return shapes.
+
+**Tests verifying this invariant**:
+- `contracts/compliance-aggregator/src/test.rs:test_allowlist_check_and_verbose_failure_and_clear`
+- `contracts/compliance-aggregator/src/test.rs:test_circuit_breaker_freeze_short_circuits_check_address`
+
 ### 6.4 Threat Model
 
 #### Threat 6.4.1: Compromised Admin Registers a Malicious Check Contract
-**Attacker capability**: Replace the registered `denylist-gate`/`jurisdiction-flag` address with an attacker-controlled contract that always returns `true`.
+**Attacker capability**: Replace a registered check address with an attacker-controlled contract that always returns `true`.
 
 **Impact**: Every downstream consumer that trusts this aggregator's `all_passed` result would accept transfers that should have been blocked — a silent compliance bypass.
 
-**Mitigation**: Same as Threat 2.4.1/1.4.1 — multisig admin, cold storage, event monitoring on `DenylistGateSet`/`JurisdictionFlagSet`.
+**Mitigation**: Same as Threat 2.4.1/1.4.1 — multisig admin, cold storage, and monitoring of check-source configuration and events.
 
 #### Threat 6.4.2: Cross-Contract Call to a Non-Responsive or Malformed Contract
 **Attacker capability**: N/A directly, but an admin misconfiguration (registering a non-contract address, or a contract that doesn't implement the expected interface) is a realistic operational failure mode.
@@ -625,9 +633,9 @@ Reduce a consumer's cross-contract call overhead by batching a `denylist-gate` c
 #### Threat 6.4.3: Consumer Misreads `checks` for Registration State
 **Attacker capability**: N/A — an integration risk.
 
-**Impact**: A consumer that assumes `checks.len() == 2` always holds (both checks registered) would misinterpret results after only one check type is registered (Invariant 6.3.2) — e.g. treating `all_passed = true` from a single-check aggregator as "cleared both denylist and jurisdiction" when only one was actually configured.
+**Impact**: A consumer that assumes a fixed number of checks would misinterpret results when fewer than all check sources are configured — e.g. treating `all_passed = true` as proof that an unconfigured source was checked.
 
-**Mitigation**: Consumers should inspect `CheckResult.check` (the `CheckKind`) in the returned list rather than assuming a fixed length, or should query `denylist_gate()`/`jurisdiction_flag()` to confirm what's registered before trusting the aggregate.
+**Mitigation**: Consumers should inspect `CheckResult.check` (the `CheckKind`) rather than assuming a fixed result length, or query `get_config()` to confirm which sources are registered.
 
 ### 6.5 Test Coverage Summary
 
@@ -637,8 +645,9 @@ Reduce a consumer's cross-contract call overhead by batching a `denylist-gate` c
 | 6.3.2 | `test_check_address_denylist_only_pass`, `test_check_address_jurisdiction_only_pass` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
 | 6.3.3 | `test_check_address_no_checks_registered`, `test_check_all_no_checks_registered` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
 | 6.3.4 | `test_check_all_empty_list_error` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
-| 6.3.5 | `test_set_admin_rejects_non_admin`, `test_set_denylist_gate_rejects_non_admin`, `test_set_jurisdiction_flag_rejects_non_admin` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
+| 6.3.5 | `test_set_admin_rejects_non_admin`, `test_set_denylist_gate_rejects_non_admin`, `test_set_jurisdiction_flag_rejects_non_admin`, `test_set_allowlist_rejects_non_admin` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
 | 6.3.6 | `test_check_all_mixed_results` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
+| 6.3.7 | `test_allowlist_check_and_verbose_failure_and_clear`, `test_circuit_breaker_freeze_short_circuits_check_address` | [`compliance-aggregator/src/test.rs`](https://github.com/stellar-compliance-kit/compliance-primitives/blob/main/contracts/compliance-aggregator/src/test.rs) |
 
 ---
 

@@ -102,6 +102,65 @@ docker run --rm \
 
 ---
 
+## Docker Compose
+
+The repository root includes a [`docker-compose.yml`](../../docker-compose.yml)
+that starts the indexer together with a Postgres service.
+
+### Services
+
+| Service | Purpose |
+|---------|---------|
+| `indexer` | Builds `tools/indexer/Dockerfile`, runs the compliance indexer, and persists its SQLite database in the `indexer_data` volume. |
+| `postgres` | Provides a Postgres 16 instance for local development and future Postgres-backed indexer work. The current indexer implementation uses SQLite; the Postgres service is provisioned so database infrastructure is available without manual setup. |
+
+### Run
+
+1. Create the indexer environment file:
+
+   ```sh
+   cp tools/indexer/.env.example tools/indexer/.env
+   # Edit tools/indexer/.env — set RPC_URL and at least one contract ID
+   ```
+
+2. Start the stack from the repository root:
+
+   ```sh
+   docker compose up --build
+   ```
+
+3. Check the indexer health endpoint:
+
+   ```sh
+   curl http://localhost:8080/health
+   curl http://localhost:8080/status
+   ```
+
+### Configuration
+
+The Compose file loads `tools/indexer/.env` when present and applies these
+defaults:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_PATH` | `/data/compliance.db` | SQLite path inside the indexer container |
+| `HEALTH_PORT` | `8080` | Port for `/health` and `/status` |
+| `POSTGRES_DB` | `compliance_indexer` | Postgres database name |
+| `POSTGRES_USER` | `indexer` | Postgres user |
+| `POSTGRES_PASSWORD` | `indexer` | Postgres password for local development |
+| `POSTGRES_PORT` | `5432` | Host port mapped to Postgres |
+
+To stop the stack:
+
+```sh
+docker compose down
+```
+
+Add `-v` if you also want to remove the `indexer_data` and `postgres_data`
+volumes.
+
+---
+
 ## npm package
 
 The indexer is published as `compliance-indexer` with compiled JavaScript and TypeScript declarations. Install a released version in an issuer or reporting service with:

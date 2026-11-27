@@ -238,7 +238,7 @@ fn test_remove_from_denylist_never_added_is_noop() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "deny_remove"), never_added.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -268,12 +268,12 @@ fn test_remove_multiple_from_denylist_removes_all_and_emits_events() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "deny_remove"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "deny_remove"), bob.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -1043,6 +1043,158 @@ fn test_revoke_approval_rejects_non_signer() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Multisig-gated denylist mutations (#386)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_multisig_threshold_met_applies_add_to_denylist() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let target = Address::generate(&env);
+
+    // First approval alone does not mutate the denylist.
+    client.add_to_denylist(&admin, &target);
+    assert!(client.check(&target));
+
+    // Second distinct signer reaches the 2-of-3 threshold.
+    client.add_to_denylist(&s1, &target);
+    assert!(!client.check(&target));
+}
+
+#[test]
+fn test_multisig_threshold_unmet_leaves_state_unchanged() {
+    let env = Env::default();
+    let (admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let target = Address::generate(&env);
+
+    client.add_to_denylist(&admin, &target);
+    assert!(client.check(&target));
+    assert!(!client.is_denylisted(&target));
+
+    // Repeated approvals from the same signer never reach the threshold.
+    client.add_to_denylist(&admin, &target);
+    assert!(client.check(&target));
+}
+
+#[test]
+fn test_multisig_non_signer_cannot_mutate_denylist() {
+    let env = Env::default();
+    let (_admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let outsider = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    assert_eq!(
+        client.try_add_to_denylist(&outsider, &target),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_remove_from_denylist(&outsider, &target),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_remove_multiple_from_denylist(&outsider, &vec![&env, target.clone()]),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(client.check(&target));
+}
+
+#[test]
+fn test_multisig_compliance_officer_cannot_bypass() {
+    let env = Env::default();
+    let (admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let officer = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    client.set_compliance_officer(&admin, &officer);
+
+    // The officer is not a signer, so multisig mode rejects the mutation.
+    assert_eq!(
+        client.try_add_to_denylist(&officer, &target),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(client.check(&target));
+}
+
+#[test]
+fn test_multisig_threshold_met_applies_remove_from_denylist() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let target = Address::generate(&env);
+
+    client.add_to_denylist(&admin, &target);
+    client.add_to_denylist(&s1, &target);
+    assert!(!client.check(&target));
+
+    // First removal approval does not clear the entry.
+    client.remove_from_denylist(&admin, &target);
+    assert!(!client.check(&target));
+
+    client.remove_from_denylist(&s1, &target);
+    assert!(client.check(&target));
+}
+
+#[test]
+fn test_multisig_threshold_met_applies_batch_remove() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let batch = vec![&env, alice.clone(), bob.clone()];
+
+    client.add_to_denylist(&admin, &alice);
+    client.add_to_denylist(&s1, &alice);
+    client.add_to_denylist(&admin, &bob);
+    client.add_to_denylist(&s1, &bob);
+    assert!(!client.check(&alice));
+    assert!(!client.check(&bob));
+
+    // One approval is not enough for the batch removal.
+    client.remove_multiple_from_denylist(&admin, &batch);
+    assert!(!client.check(&alice));
+    assert!(!client.check(&bob));
+
+    client.remove_multiple_from_denylist(&s1, &batch);
+    assert!(client.check(&alice));
+    assert!(client.check(&bob));
+}
+
+#[test]
+fn test_denylist_mutation_authority_before_and_after_multisig() {
+    let env = Env::default();
+    let (admin, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    // Before multisig mode, the admin alone can mutate the denylist.
+    client.add_to_denylist(&admin, &target);
+    assert!(!client.check(&target));
+    client.remove_from_denylist(&admin, &target);
+    assert!(client.check(&target));
+
+    // Enable 2-of-3 multisig; the admin is now just one signer.
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let signers = vec![&env, admin.clone(), s1.clone(), s2.clone()];
+    client.initialize_multisig(&admin, &signers, &2);
+
+    // A single admin approval no longer mutates the denylist.
+    client.add_to_denylist(&admin, &target);
+    assert!(client.check(&target));
+
+    // A second signer completes the threshold.
+    client.add_to_denylist(&s1, &target);
+    assert!(!client.check(&target));
+
+    // The compliance officer still cannot bypass multisig mode.
+    client.set_compliance_officer(&admin, &officer);
+    assert_eq!(
+        client.try_remove_from_denylist(&officer, &target),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(!client.check(&target));
+}
+
 #[test]
 fn test_write_path_extends_instance_ttl() {
     use soroban_sdk::testutils::storage::Instance as _;
@@ -1058,4 +1210,42 @@ fn test_write_path_extends_instance_ttl() {
 
     client.add_to_denylist(&admin, &Address::generate(&env));
     assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+}
+
+#[test]
+fn check_pair_reports_failing_side() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    assert_eq!(client.try_check_pair(&a, &b), Ok(Ok(())));
+    client.add_to_denylist(&admin, &b);
+    assert_eq!(client.try_check_pair(&a, &b), Err(Ok(Error::ReceiverDenied)));
+    client.add_to_denylist(&admin, &a);
+    assert_eq!(client.try_check_pair(&a, &b), Err(Ok(Error::SenderDenied)));
+    client.remove_from_denylist(&admin, &b);
+    assert_eq!(client.try_check_pair(&b, &a), Err(Ok(Error::ReceiverDenied)));
+}
+
+#[test]
+fn entries_record_source_list() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    let tagged = Address::generate(&env);
+    let plain = Address::generate(&env);
+    let ofac = Symbol::new(&env, "OFAC");
+    client.add_to_denylist_with_source(&admin, &tagged, &ofac);
+    client.add_to_denylist(&admin, &plain);
+
+    assert_eq!(
+        client.get_entry(&tagged),
+        Some(DenylistEntry { address: tagged.clone(), source: Some(ofac.clone()) })
+    );
+    assert_eq!(client.get_entry(&plain).unwrap().source, None);
+    assert!(client.is_denylisted(&tagged));
+
+    client.remove_from_denylist(&admin, &tagged);
+    assert_eq!(client.get_entry(&tagged), None);
+    client.add_to_denylist(&admin, &tagged);
+    assert_eq!(client.get_entry(&tagged).unwrap().source, None);
 }

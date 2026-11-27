@@ -54,6 +54,11 @@ fn fuzz_policy_engine_tree_and_evaluation() {
         };
         client.initialize(&admin, &op, &None);
 
+        // 1b. Create a named policy and add checks to it. The fuzzer exercises
+        // both the default (unnamed) policy and this named policy.
+        let policy_name = String::from_str(&env, "fuzz-policy");
+        client.create_policy(&admin, &policy_name, &op, &None);
+
         // 2. Setup multiple denylist gates and jurisdiction flags
         let num_gates = 2;
         let mut gates = std::vec::Vec::new();
@@ -97,22 +102,23 @@ fn fuzz_policy_engine_tree_and_evaluation() {
             }
         }
 
-        // Model representation of registered checks
+        // Model representation of registered checks (default policy)
         let mut registered_checks = std::vec::Vec::new();
+        // Model representation of checks registered under the named policy
+        let mut named_checks = std::vec::Vec::new();
 
         // 4. Random operations loop
         for _ in 0..ops_per_iter {
             let action = next_u32(&mut rng) % 5;
             match action {
                 0 => {
-                    // Add check
-                    if next_u32(&mut rng) % 2 == 0 {
+                    // Add check, either to the default policy or the named one.
+                    let to_named = next_u32(&mut rng) % 2 == 0;
+                    let check = if next_u32(&mut rng) % 2 == 0 {
                         let gate_idx = next_usize(&mut rng, num_gates);
-                        let check = CheckKind::Denylist(DenylistCheck {
+                        CheckKind::Denylist(DenylistCheck {
                             contract: gates[gate_idx].clone(),
-                        });
-                        client.add_check(&admin, &check);
-                        registered_checks.push(check);
+                        })
                     } else {
                         let flag_idx = next_usize(&mut rng, num_flags);
                         let allowed_codes_vec = vec![
@@ -120,17 +126,29 @@ fn fuzz_policy_engine_tree_and_evaluation() {
                             String::from_str(&env, permitted_codes[0]),
                             String::from_str(&env, permitted_codes[1]),
                         ];
-                        let check = CheckKind::Jurisdiction(JurisdictionCheck {
+                        CheckKind::Jurisdiction(JurisdictionCheck {
                             contract: flags[flag_idx].clone(),
                             allowed_codes: allowed_codes_vec,
-                        });
+                        })
+                    };
+                    if to_named {
+                        client.add_policy_check(&admin, &policy_name, &check);
+                        named_checks.push(check);
+                    } else {
                         client.add_check(&admin, &check);
                         registered_checks.push(check);
                     }
                 }
                 1 => {
-                    // Remove check
-                    if !registered_checks.is_empty() {
+                    // Remove check from either the default or named policy.
+                    let from_named = next_u32(&mut rng) % 2 == 0;
+                    if from_named {
+                        if !named_checks.is_empty() {
+                            let idx = next_usize(&mut rng, named_checks.len());
+                            client.remove_policy_check(&admin, &policy_name, &(idx as u32));
+                            named_checks.remove(idx);
+                        }
+                    } else if !registered_checks.is_empty() {
                         let idx = next_usize(&mut rng, registered_checks.len());
                         client.remove_check(&admin, &(idx as u32));
                         registered_checks.remove(idx);
@@ -274,6 +292,51 @@ fn fuzz_policy_engine_tree_and_evaluation() {
                         &all_codes,
                     );
                     assert_eq!(batch_results.get(1).unwrap(), expected_rev);
+
+                    // Evaluate the named policy and verify against its model.
+                    let named_result =
+                        client.evaluate_policy(&policy_name, &addresses[from_idx], &addresses[to_idx]);
+                    let named_expected = evaluate_model(
+                        &op,
+                        &named_checks,
+                        from_idx,
+                        to_idx,
+                        &gates,
+                        &flags,
+                        &denylist_states,
+                        &jurisdiction_states,
+                        &permitted_codes,
+                        &all_codes,
+                    );
+                    assert_eq!(
+                        named_result, named_expected,
+                        "seed={seed}: named policy mismatch from={from_idx} to={to_idx}"
+                    );
+
+                    // Exercise the amount-aware entry point. The fuzz harness
+                    // registers no amount-sensitive checks, so the result must
+                    // match the amount-less evaluation.
+                    let amount = (next_u32(&mut rng) % 1_000_000) as i128;
+                    let with_amount = client.evaluate_with_amount(
+                        &addresses[from_idx],
+                        &addresses[to_idx],
+                        &Some(amount),
+                    );
+                    assert_eq!(
+                        with_amount, result,
+                        "seed={seed}: amount-aware evaluate mismatch from={from_idx} to={to_idx}"
+                    );
+
+                    let named_with_amount = client.evaluate_policy_with_amount(
+                        &policy_name,
+                        &addresses[from_idx],
+                        &addresses[to_idx],
+                        &Some(amount),
+                    );
+                    assert_eq!(
+                        named_with_amount, named_expected,
+                        "seed={seed}: named amount-aware evaluate mismatch from={from_idx} to={to_idx}"
+                    );
                 }
                 _ => unreachable!(),
             }

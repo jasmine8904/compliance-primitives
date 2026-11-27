@@ -1,0 +1,314 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+function usage(exitCode = 0) {
+  const text = `Usage: compliance-cli [global options] <subcommand> ...
+
+Subcommands:
+  allowlist add|remove <address> [--expiration-ledger <ledger>]
+  denylist add|remove <address>
+  jurisdiction set|add|remove <address> <code>
+  freeze freeze|unfreeze <address> [--contract allowlist|circuit-breaker]
+  pause pause|unpause [--contract allowlist|denylist|jurisdiction]
+
+Global options:
+  --config <file>       Config file (default: compliance-cli.env)
+  --network <network>   Stellar network (default: STELLAR_NETWORK or testnet)
+  --source <identity>   Stellar CLI signing identity
+  --admin <address>     Address used for admin/issuer contract arguments
+  --dry-run             Print the stellar invoke command without executing it
+  --help                Show help
+
+Config format:
+  Key/value .env-style or JSON. Supported keys:
+  ALLOWLIST_CONTRACT_ID, DENYLIST_CONTRACT_ID,
+  JURISDICTION_CONTRACT_ID, CIRCUIT_BREAKER_CONTRACT_ID
+`;
+  process.stdout.write(text);
+  process.exitCode = exitCode;
+}
+
+function fail(message) {
+  process.stderr.write(`compliance-cli: ${message}\n`);
+  process.exitCode = 1;
+  return null;
+}
+
+function parseArgs(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      out.help = true;
+    } else if (arg === '--dry-run') {
+      out.dryRun = true;
+    } else if (arg.startsWith('--')) {
+      const key = arg.slice(2);
+      if (i + 1 >= argv.length) return fail(`missing value for --${key}`);
+      out[key] = argv[++i];
+    } else {
+      out._.push(arg);
+    }
+  }
+  return out;
+}
+
+function envLoad(file) {
+  const values = {};
+  for (const rawLine of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    values[match[1]] = value;
+  }
+  return values;
+}
+
+function loadConfig(explicitPath) {
+  let file = explicitPath;
+  if (!file) {
+    const candidates = [
+      path.resolve(process.cwd(), 'compliance-cli.env'),
+      path.resolve(process.cwd(), 'tools', 'compliance-cli.env'),
+      path.resolve(process.cwd(), '.env'),
+    ];
+    file = candidates.find((candidate) => fs.existsSync(candidate));
+  }
+  if (!file) return {};
+  file = path.resolve(file);
+  if (!fs.existsSync(file)) return fail(`config file not found: ${file}`);
+
+  if (file.toLowerCase().endsWith('.json')) {
+    const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return flattenConfig(json);
+  }
+  if (file.toLowerCase().endsWith('.toml')) {
+    return parseTomlConfig(file);
+  }
+  return envLoad(file);
+}
+
+function flattenConfig(json) {
+  const result = {};
+  if (!json || typeof json !== 'object') return result;
+  for (const [key, value] of Object.entries(json)) {
+    if (typeof value === 'string') result[key.toUpperCase()] = value;
+  }
+  for (const [section, values] of Object.entries(json)) {
+    if (values && typeof values === 'object' && !Array.isArray(values)) {
+      for (const [key, value] of Object.entries(values)) {
+        if (typeof value === 'string') {
+          result[`${section}_${key}`.toUpperCase()] = value;
+        }
+      }
+    }
+  }
+  const aliases = {
+    allowlist: ['ALLOWLIST_CONTRACT_ID', 'ALLOWLIST_ID'],
+    denylist: ['DENYLIST_CONTRACT_ID', 'DENYLIST_GATE_CONTRACT_ID', 'DENYLIST_ID'],
+    jurisdiction: ['JURISDICTION_CONTRACT_ID', 'JURISDICTION_ID'],
+    circuitBreaker: ['CIRCUIT_BREAKER_CONTRACT_ID', 'CIRCUIT_BREAKER_ID'],
+  };
+  for (const [canonical, keys] of Object.entries(aliases)) {
+    for (const key of keys) {
+      if (result[key]) result[canonical] = result[key];
+    }
+  }
+  return result;
+}
+
+function parseTomlConfig(file) {
+  const result = {};
+  let section = '';
+  for (const rawLine of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      section = sectionMatch[1].trim().replace(/[.-]/g, '_');
+      continue;
+    }
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    const key = section ? `${section}_${match[1]}` : match[1];
+    result[key.toUpperCase()] = value;
+  }
+  return flattenConfig(result);
+}
+
+function idFor(config, kind) {
+  const aliases = {
+    allowlist: ['ALLOWLIST_CONTRACT_ID', 'ALLOWLIST_ID', 'ALLOWLIST'],
+    denylist: ['DENYLIST_CONTRACT_ID', 'DENYLIST_GATE_CONTRACT_ID', 'DENYLIST_ID', 'DENYLIST'],
+    jurisdiction: ['JURISDICTION_CONTRACT_ID', 'JURISDICTION_ID', 'JURISDICTION'],
+    'circuit-breaker': ['CIRCUIT_BREAKER_CONTRACT_ID', 'CIRCUIT_BREAKER_ID', 'CIRCUIT_BREAKER'],
+  };
+  for (const key of aliases[kind] || []) {
+    if (config[key]) return config[key];
+  }
+  return null;
+}
+
+function invoke(options, contractId, args) {
+  if (!contractId) return fail(`contract ID is missing for ${args.contractName}`);
+
+  const network = options.network || process.env.STELLAR_NETWORK || 'testnet';
+  const source = options.source || process.env.STELLAR_SOURCE;
+  const command = ['stellar', 'contract', 'invoke', '--id', contractId];
+  if (source) command.push('--source', source);
+  command.push('--network', network, '--', ...args.methodAndArgs);
+
+  if (options.dryRun) {
+    process.stdout.write(command.map(shellQuote).join(' ') + '\n');
+    return true;
+  }
+  if (!source) return fail('missing signing source: use --source or STELLAR_SOURCE');
+
+  const result = spawnSync(command[0], command.slice(1), { stdio: 'inherit' });
+  if (result.error) return fail(`failed to run stellar: ${result.error.message}`);
+  if (result.status !== 0) {
+    process.exitCode = result.status || 1;
+    return null;
+  }
+  return true;
+}
+
+function shellQuote(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:@=-]+$/.test(text)) return text;
+  return `'${text.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function getGlobal(argv) {
+  const parsed = parseArgs(argv);
+  if (typeof parsed === 'object' && parsed._) return parsed;
+  return null;
+}
+
+function normalizeAction(action, allowed) {
+  const aliases = { add: 'add', set: 'set', remove: 'remove', del: 'remove',
+    freeze: 'freeze', unfreeze: 'unfreeze', pause: 'pause', unpause: 'unpause' };
+  const normalized = aliases[action];
+  if (!allowed.includes(normalized)) return null;
+  return normalized;
+}
+
+function main(argv) {
+  const options = getGlobal(argv);
+  if (!options) return;
+  if (options.help || options._.length === 0) return usage();
+
+  let config;
+  try {
+    config = loadConfig(options.config);
+  } catch (error) {
+    return fail(`invalid config: ${error.message}`);
+  }
+  if (!config) return;
+
+  options.network = options.network || config.STELLAR_NETWORK || process.env.STELLAR_NETWORK;
+  options.source = options.source || config.STELLAR_SOURCE || process.env.STELLAR_SOURCE;
+  options.admin = options.admin || config.STELLAR_ADMIN || process.env.STELLAR_ADMIN;
+
+  const [subcommand, ...rest] = options._;
+  const admin = options.admin || process.env.STELLAR_ADMIN;
+
+  if (subcommand === 'allowlist') {
+    const action = normalizeAction(rest.shift(), ['add', 'remove']);
+    if (!action) return usage(1);
+    const address = rest.shift();
+    if (!address) return fail('allowlist requires an address');
+    if (!admin) return fail('allowlist requires --admin or STELLAR_ADMIN');
+    const method = action === 'add' ? 'add_to_allowlist' : 'remove_from_allowlist';
+    const methodArgs = [method, '--admin', admin, '--address', address];
+    if (action === 'add' && options['expiration-ledger']) {
+      methodArgs.push('--expiration_ledger', options['expiration-ledger']);
+    }
+    return invoke(options, idFor(config, 'allowlist'),
+      { contractName: 'allowlist-token', methodAndArgs: methodArgs });
+  }
+
+  if (subcommand === 'denylist') {
+    const action = normalizeAction(rest.shift(), ['add', 'remove']);
+    if (!action) return usage(1);
+    const address = rest.shift();
+    if (!address) return fail('denylist requires an address');
+    if (!admin) return fail('denylist requires --admin or STELLAR_ADMIN');
+    const method = action === 'add' ? 'add_to_denylist' : 'remove_from_denylist';
+    return invoke(options, idFor(config, 'denylist'),
+      { contractName: 'denylist-gate', methodAndArgs: [method, '--admin', admin, '--address', address] });
+  }
+
+  if (subcommand === 'jurisdiction') {
+    const action = normalizeAction(rest.shift(), ['set', 'add', 'remove']);
+    if (!action) return usage(1);
+    const address = rest.shift();
+    const code = rest.shift();
+    if (!address || !code) return usage(1);
+    if (!admin) return fail('jurisdiction requires --admin or STELLAR_ADMIN');
+    let method = action === 'set' ? 'set_jurisdiction'
+      : action === 'add' ? 'add_jurisdiction' : 'remove_jurisdiction';
+    const methodArgs = [method, '--issuer', admin, '--address', address];
+    if (action !== 'remove' || code) methodArgs.push('--code', code);
+    return invoke(options, idFor(config, 'jurisdiction'),
+      { contractName: 'jurisdiction-flag', methodAndArgs: methodArgs });
+  }
+
+  if (subcommand === 'freeze') {
+    const action = normalizeAction(rest.shift(), ['freeze', 'unfreeze']);
+    if (!action) return usage(1);
+    const address = rest.shift();
+    const contract = options.contract || 'allowlist';
+    if (!address) return fail('freeze requires an address');
+    if (!admin) return fail('freeze requires --admin or STELLAR_ADMIN');
+
+    if (contract === 'allowlist') {
+      const method = action === 'freeze' ? 'freeze' : 'unfreeze';
+      return invoke(options, idFor(config, 'allowlist'),
+        { contractName: 'allowlist-token', methodAndArgs: [method, '--caller', admin, '--address', address] });
+    }
+    if (contract === 'circuit-breaker' || contract === 'circuit') {
+      const method = action === 'freeze' ? 'freeze' : 'unfreeze';
+      const methodArgs = action === 'freeze'
+        ? [method, '--caller', admin]
+        : [method, '--admin', admin];
+      return invoke(options, idFor(config, 'circuit-breaker'),
+        { contractName: 'circuit-breaker', methodAndArgs: methodArgs });
+    }
+    return fail(`unknown freeze contract: ${contract}`);
+  }
+
+  if (subcommand === 'pause') {
+    const action = normalizeAction(rest.shift(), ['pause', 'unpause']);
+    if (!action) return usage(1);
+    const contract = options.contract || 'allowlist';
+    if (!admin) return fail('pause requires --admin or STELLAR_ADMIN');
+    const kind = contract === 'denylist' ? 'denylist'
+      : contract === 'jurisdiction' ? 'jurisdiction' : 'allowlist';
+    const contractName = kind === 'denylist' ? 'denylist-gate'
+      : kind === 'jurisdiction' ? 'jurisdiction-flag' : 'allowlist-token';
+    const role = kind === 'jurisdiction' ? '--issuer' : '--admin';
+    return invoke(options, idFor(config, kind),
+      { contractName, methodAndArgs: [action, role, admin] });
+  }
+
+  return fail(`unknown subcommand: ${subcommand}`);
+}
+
+if (require.main === module) main(process.argv.slice(2));
+
+module.exports = { loadConfig, parseArgs, idFor, main };

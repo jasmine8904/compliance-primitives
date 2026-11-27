@@ -1,0 +1,24 @@
+[package]
+name = "tokenized-fund"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference tokenized fund composing allowlist, jurisdiction-flag, and circuit-breaker checks."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+allowlist-token = { path = "../../contracts/allowlist-token", features = ["testutils"] }
+circuit-breaker = { path = "../../contracts/circuit-breaker", features = ["testutils"] }
+jurisdiction-flag = { path = "../../contracts/jurisdiction-flag", features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

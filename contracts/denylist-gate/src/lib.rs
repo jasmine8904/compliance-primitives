@@ -32,7 +32,26 @@
 //! remain admin-only.
 //!
 //! `initialize_multisig` (admin-only, callable once) additionally installs an
-//! M-of-N signer set. From then on the signer set is governed as follows:
+//! M-of-N signer set. From then on the signer set gates denylist mutations:
+//!
+//! - `add_to_denylist`, `remove_from_denylist` and
+//!   `remove_multiple_from_denylist` take the calling `caller` explicitly.
+//!   Each call runs `caller.require_auth()` and then requires `caller` to be in
+//!   the *current* signer set; any other address is rejected with
+//!   `NotAuthorized`. The `Admin` and `ComplianceOfficer` no longer have
+//!   unilateral denylist authority once multisig mode is enabled.
+//! - A denylist mutation does not take effect on a single signer's say-so.
+//!   Each call records one approval from `caller` for that exact action
+//!   (`DenyAdd(X)` / `DenyRemove(X)`), de-duplicated per signer. The mutation
+//!   is applied, and its pending approvals cleared, only once `threshold`
+//!   distinct current signers have approved it. Until then the call returns
+//!   `Ok(())` with the mutation still pending.
+//! - `Admin` keeps every admin-only power (pause, officer assignment,
+//!   audit-log configuration, upgrades, admin rotation, signer governance).
+//!   `ComplianceOfficer` keeps its role but has no denylist authority while
+//!   multisig mode is enabled.
+//!
+//! The signer set governs its own membership as follows:
 //!
 //! - `add_signer` and `remove_signer` take the calling `caller` explicitly.
 //!   Each call runs `caller.require_auth()` and then requires `caller` to be in
@@ -75,9 +94,9 @@ pub const MIN_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
 /// Instance-storage TTL policy: whenever the remaining instance TTL drops
 /// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
 /// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
-pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub const INSTANCE_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 /// Target instance TTL after an extension.
-pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 // ---------------------------------------------------------------------------
 // Storage
@@ -94,7 +113,16 @@ enum DataKey {
     ComplianceOfficer,
     AuditLog,
     SignerSet,
+    /// Legacy denylist flag (`true`) written before entries carried metadata.
+    /// Still honoured by `check()`; superseded by `DenyEntry` on the next
+    /// add or removal. Never written by current code.
     Denied(Address),
+    /// Denylist entry with its metadata (`DenyEntry`). Persistent storage.
+    DenyEntry(Address),
+    /// Number of addresses currently on the denylist. Instance storage.
+    DenylistCount,
+    /// Sanctions list an entry came from (e.g. `OFAC`). Persistent storage.
+    DeniedSource(Address),
     PendingUpgrade,
     /// Approvals collected so far for one pending signer-set change.
     /// Persistent storage (not instance), so abandoned proposals do not bloat
@@ -108,6 +136,30 @@ enum DataKey {
 pub struct UpgradeState {
     pub new_wasm: BytesN<32>,
     pub activated_at: u64,
+}
+
+/// Metadata recorded when an address is added to the denylist.
+///
+/// `added_at` is the ledger timestamp (seconds since the Unix epoch) of the
+/// first add. `added_by` is the admin or compliance officer that made it.
+/// Re-adding an address that is already denied keeps the original values.
+///
+/// **Migration.** Entries written before this struct existed are stored as a
+/// bare `true` flag and have no `DenyEntry`. They remain denylisted (`check`
+/// still reports them), but `get_denylist_entry` returns `None` for them and
+/// they are not included in `denylist_count`. To give such an entry metadata
+/// and count it, re-add it with `add_to_denylist`; that writes a `DenyEntry`
+/// and drops the legacy flag.
+#[contracttype]
+#[derive(Clone)]
+pub struct DenyEntry {
+    pub added_at: u64,
+    pub added_by: Address,
+    /// Ledger sequence at which the entry stops applying. The address is
+    /// denylisted while `current ledger < expires_at_ledger`. `None` means the
+    /// entry lasts until it is removed. Set by `add_to_denylist_until`, and
+    /// reset to `None` by `add_to_denylist`.
+    pub expires_at_ledger: Option<u32>,
 }
 
 /// Current on-chain schema version for this contract instance.
@@ -143,28 +195,26 @@ pub struct CheckResult {
 /// The M-of-N signer set, stored under `DataKey::SignerSet` in instance
 /// storage once `initialize_multisig` has run.
 ///
-/// **Scope of the multisig layer.** The signer set only governs *itself*:
-/// `add_signer`, `remove_signer` and `set_threshold` each need `threshold`
-/// distinct approvals from current `signers` before they take effect.
-///
-/// It is **not** connected to denylist mutations or to the other admin
-/// operations. After `initialize_multisig`:
+/// **Scope of the multisig layer.** Once installed, the signer set gates
+/// denylist mutations as well as its own membership:
 ///
 /// - `add_to_denylist`, `remove_from_denylist` and
-///   `remove_multiple_from_denylist` are still gated by the single-admin
-///   `require_compliance_authority` check, i.e. the `Admin` or the
-///   `ComplianceOfficer` alone can mutate the denylist.
+///   `remove_multiple_from_denylist` each need `threshold` distinct approvals
+///   from current `signers` before they take effect. The single-admin
+///   `require_compliance_authority` check is bypassed entirely in this mode.
+/// - `add_signer`, `remove_signer` and `set_threshold` each need `threshold`
+///   distinct approvals from current `signers` before they take effect.
 /// - `Admin` keeps every admin-only power (pause, officer assignment,
 ///   audit-log configuration, upgrades, admin rotation). `ComplianceOfficer`
-///   is unchanged.
-/// - Signers have no denylist or admin rights by virtue of being signers.
+///   keeps its role but has no denylist authority while multisig is enabled.
+/// - Signers have no admin rights by virtue of being signers.
 ///
-/// Treat the signer set as a separate, currently-unconnected governance
-/// layer, not as a replacement for the admin key.
+/// Treat the signer set as the governance layer for denylist mutations, not
+/// as a replacement for the admin key for the remaining admin operations.
 #[contracttype]
 #[derive(Clone)]
 pub struct SignerSet {
-    /// Distinct addresses allowed to approve signer-set changes.
+    /// Distinct addresses allowed to approve signer-set and denylist changes.
     pub signers: Vec<Address>,
     /// Number of distinct current signers whose approval applies a change
     /// (`1 <= threshold <= signers.len()`).
@@ -188,13 +238,17 @@ pub struct PendingApproval {
 /// starts a fresh proposal.
 pub const APPROVAL_TTL_LEDGERS: u32 = 120_960;
 
-/// A signer-set change that needs `threshold` distinct approvals to apply.
+/// An action that needs `threshold` distinct signer approvals to apply.
 #[contracttype]
 #[derive(Clone)]
 pub enum SignerAction {
     Add(Address),
     Remove(Address),
     SetThreshold(u32),
+    /// Add `address` to the denylist (multisig mode only).
+    DenyAdd(Address),
+    /// Remove `address` from the denylist (multisig mode only).
+    DenyRemove(Address),
 }
 
 #[contractclient(name = "AuditLogClient")]
@@ -211,12 +265,34 @@ pub trait AuditLogInterface {
 pub struct DenyAdd {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
+}
+
+/// Emitted alongside [`DenyAdd`] when an entry is tagged with its source list.
+#[contractevent]
+pub struct DenyAddSourced {
+    #[topic]
+    pub address: Address,
+    #[topic]
+    pub source: Symbol,
+}
+
+/// View of a single denylist entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenylistEntry {
+    pub address: Address,
+    /// Sanctions list the entry came from, if tagged.
+    pub source: Option<Symbol>,
 }
 
 #[contractevent]
 pub struct DenyRemove {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted when the optional audit-log write fails (paused, archived, or
@@ -365,6 +441,14 @@ pub enum Error {
     NoPendingAdmin = 13,
     PendingAdminMismatch = 14,
     UpgradeDelayTooShort = 15,
+    InvalidExpiry = 16,
+    /// `check_pair`: the sender (`from`) is denylisted.
+    SenderDenied = 17,
+    /// `check_pair`: the receiver (`to`) is denylisted.
+    ReceiverDenied = 18,
+    /// The caller is not a current signer, or multisig mode is required for
+    /// this operation but has not been enabled.
+    SignerApprovalRequired = 19,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +470,7 @@ impl DenylistGate {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::DenylistCount, &0u32);
         Ok(())
     }
 
@@ -653,7 +738,15 @@ impl DenylistGate {
             .unwrap_or(false)
     }
 
-    /// Add `address` to the denylist. Admin or compliance-officer.
+    /// Add `address` to the denylist.
+    ///
+    /// **Single-admin mode** (no signer set installed): `caller` must be the
+    /// `Admin` or the `ComplianceOfficer`.
+    ///
+    /// **Multisig mode** (signer set installed): `caller` must authorize the
+    /// call and be in the current signer set. The entry is added once
+    /// `threshold` distinct current signers have approved this exact action;
+    /// until then the call returns `Ok(())` with the mutation still pending.
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.
     ///
@@ -662,61 +755,186 @@ impl DenylistGate {
     /// configuration keys (admin, pause flag, signer set, ...) are kept alive
     /// separately: Soroban never extends instance TTL implicitly, so every
     /// write path (and `check`) calls `extend_instance_ttl` explicitly.
-    pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+    pub fn add_to_denylist(env: Env, caller: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
+        if let Some(signer_set) = Self::require_denylist_authority(&env, &caller)? {
+            return Self::approve(&env, caller, SignerAction::DenyAdd(address), signer_set);
+        }
+        Self::deny(&env, &caller, &address, None, None)
+    }
 
-        const MAX_TTL: u32 = 6_311_520;
-        const THRESHOLD: u32 = MAX_TTL / 2;
+    /// Add `address` to the denylist, tagged with the sanctions list it came
+    /// from (e.g. `OFAC`, `UN`, `EU`). Admin or compliance-officer.
+    ///
+    /// Emits [`DenyAdd`] and [`DenyAddSourced`]; the tag is returned by
+    /// [`get_entry`](Self::get_entry) and cleared on removal.
+    pub fn add_to_denylist_with_source(
+        env: Env,
+        admin: Address,
+        address: Address,
+        source: Symbol,
+    ) -> Result<(), Error> {
+        Self::deny(&env, &admin, &address, None, Some(source))
+    }
 
-        let key = DataKey::Denied(address.clone());
-        env.storage().persistent().set(&key, &true);
-        env.storage()
+    /// Return the denylist entry for `address`, or `None` if not denylisted.
+    pub fn get_entry(env: Env, address: Address) -> Option<DenylistEntry> {
+        if !Self::is_denied(&env, &address) {
+            return None;
+        }
+        let source = env
+            .storage()
             .persistent()
-            .extend_ttl(&key, THRESHOLD, MAX_TTL);
+            .get(&DataKey::DeniedSource(address.clone()));
+        Some(DenylistEntry { address, source })
+    }
+
+    /// Add `address` to the denylist for a limited time. Admin or compliance-officer.
+    ///
+    /// The address is denylisted while the current ledger sequence is below
+    /// `until_ledger`, and clear from `until_ledger` onwards. `until_ledger`
+    /// must be in the future (`InvalidExpiry` otherwise). Calling this on an
+    /// address that is already denylisted replaces its expiry.
+    ///
+    /// Expired entries are not removed from storage, so they still count in
+    /// `denylist_count` until `remove_from_denylist` is called for them.
+    pub fn add_to_denylist_until(
+        env: Env,
+        admin: Address,
+        address: Address,
+        until_ledger: u32,
+    ) -> Result<(), Error> {
+        Self::deny(&env, &admin, &address, Some(until_ledger), None)
+    }
+
+    /// Shared body of the add entry points.
+    fn deny(
+        env: &Env,
+        admin: &Address,
+        address: &Address,
+        expires_at_ledger: Option<u32>,
+        source: Option<Symbol>,
+    ) -> Result<(), Error> {
+        const MAX_TTL: u32 = compliance_ttl::DENYLIST_ENTRY_TTL_EXTEND_TO;
+        const THRESHOLD: u32 = compliance_ttl::DENYLIST_ENTRY_TTL_THRESHOLD;
+
+        Self::reject_if_paused(env)?;
+        Self::require_compliance_authority(env, admin)?;
+        if let Some(until) = expires_at_ledger {
+            if until <= env.ledger().sequence() {
+                return Err(Error::InvalidExpiry);
+            }
+        }
+
+        Self::record_entry(env, admin, address, expires_at_ledger);
+
+        let source_key = DataKey::DeniedSource(address.clone());
+        match &source {
+            Some(src) => {
+                env.storage().persistent().set(&source_key, src);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&source_key, THRESHOLD, MAX_TTL);
+            }
+            None => env.storage().persistent().remove(&source_key),
+        }
 
         DenyAdd {
             address: address.clone(),
+            by: admin.clone(),
         }
-        .publish(&env);
-        Self::record_audit(&env, Symbol::new(&env, "deny_add"), &address, "address added to denylist");
+        .publish(env);
+        if let Some(source) = source {
+            DenyAddSourced {
+                address: address.clone(),
+                source,
+            }
+            .publish(env);
+        }
+        Self::record_audit(env, Symbol::new(env, "deny_add"), address, "address added to denylist");
         Ok(())
     }
 
-    /// Remove `address` from the denylist. Admin or compliance-officer.
-    pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+    /// Remove `address` from the denylist.
+    ///
+    /// **Single-admin mode**: `caller` must be the `Admin` or the
+    /// `ComplianceOfficer`. **Multisig mode**: `caller` must be a current
+    /// signer and `threshold` distinct signers must approve the removal before
+    /// it takes effect.
+    pub fn remove_from_denylist(env: Env, caller: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Denied(address.clone()));
+        if let Some(signer_set) = Self::require_denylist_authority(&env, &caller)? {
+            return Self::approve(&env, caller, SignerAction::DenyRemove(address), signer_set);
+        }
+        Self::remove_entry(&env, &address);
         DenyRemove {
             address: address.clone(),
+            by: caller,
         }
         .publish(&env);
         Self::record_audit(&env, Symbol::new(&env, "deny_remove"), &address, "address removed from denylist");
         Ok(())
     }
 
-    /// Remove every address in `addresses` from the denylist. Admin or compliance-officer.
+    /// Remove every address in `addresses` from the denylist.
+    ///
+    /// **Single-admin mode**: `caller` must be the `Admin` or the
+    /// `ComplianceOfficer`. **Multisig mode**: `caller` must be a current
+    /// signer and `threshold` distinct signers must approve the removal of
+    /// each address before it takes effect.
     pub fn remove_multiple_from_denylist(
         env: Env,
-        admin: Address,
+        caller: Address,
         addresses: Vec<Address>,
     ) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
         if addresses.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
         }
+        if let Some(signer_set) = Self::require_denylist_authority(&env, &caller)? {
+            for address in addresses.iter() {
+                Self::approve(
+                    &env,
+                    caller.clone(),
+                    SignerAction::DenyRemove(address),
+                    signer_set.clone(),
+                )?;
+            }
+            return Ok(());
+        }
 
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Denied(address.clone()));
-            DenyRemove { address }.publish(&env);
+            Self::remove_entry(&env, &address);
+            DenyRemove { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
+    }
+
+    /// Return the metadata recorded for a denylist entry, if one exists.
+    ///
+    /// Returns `None` for addresses that are not denylisted and for legacy
+    /// entries written before `DenyEntry` existed (see [`DenyEntry`]).
+    pub fn get_denylist_entry(env: Env, address: Address) -> Option<DenyEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DenyEntry(address))
+    }
+
+    /// Number of addresses currently on the denylist.
+    ///
+    /// Counts entries recorded as a `DenyEntry`. Legacy entries (see
+    /// [`DenyEntry`]) are not counted until they are re-added.
+    ///
+    /// Maintained on actual state changes only: an add counts only when the
+    /// address was not already denied, and a removal counts only when the
+    /// address was denied. Repeated adds/removes and removals of non-denied
+    /// addresses leave the count unchanged.
+    pub fn denylist_count(env: Env) -> u32 {
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::DenylistCount)
+            .unwrap_or(0)
     }
 
     /// Returns `true` if `address` is clear to transact, i.e. it is NOT on
@@ -724,12 +942,57 @@ impl DenylistGate {
     /// cross-contract invocation before proceeding with a transfer.
     ///
     /// **Not** affected by pause state — reads always succeed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `gate` is a `DenylistGateClient` for the deployed contract.
+    /// if !gate.check(&recipient) {
+    ///     panic!("recipient is denylisted");
+    /// }
+    /// ```
     pub fn check(env: Env, address: Address) -> bool {
         Self::extend_instance_ttl(&env);
-        !env.storage()
+        !Self::is_denied(&env, &address)
+    }
+
+    /// Batched form of [`is_denylisted`]: returns one flag per input address,
+    /// in the same order, where `true` means the address IS on the denylist.
+    ///
+    /// Intended for screening many counterparties in one call. Fails with
+    /// `BatchTooLarge` if more than `MAX_BATCH_SIZE` addresses are passed.
+    ///
+    /// **Not** affected by pause state — reads always succeed.
+    pub fn is_denylisted_batch(env: Env, addresses: Vec<Address>) -> Result<Vec<bool>, Error> {
+        if addresses.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        Self::extend_instance_ttl(&env);
+        let mut flags = Vec::new(&env);
+        for address in addresses.iter() {
+            flags.push_back(Self::is_denied(&env, &address));
+        }
+        Ok(flags)
+    }
+
+    /// Check both sides of a transfer in one call.
+    ///
+    /// Returns `Ok(())` if neither address is denylisted, otherwise
+    /// [`Error::SenderDenied`] (checked first) or [`Error::ReceiverDenied`].
+    /// **Not** affected by pause state.
+    pub fn check_pair(env: Env, from: Address, to: Address) -> Result<(), Error> {
+        if !Self::check(env.clone(), from) {
+            return Err(Error::SenderDenied);
+        }
+        if !env
+            .storage()
             .persistent()
-            .get(&DataKey::Denied(address))
+            .get(&DataKey::Denied(to))
             .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        Err(Error::ReceiverDenied)
     }
 
     /// Unified compliance check — returns a [`CheckResult`] describing whether
@@ -778,11 +1041,12 @@ impl DenylistGate {
     /// `signers` must be non-empty and free of duplicates, and `threshold`
     /// must be between 1 and `signers.len()`.
     ///
-    /// This does **not** switch the contract into multisig mode for denylist
-    /// mutations: `add_to_denylist` / `remove_from_denylist` keep using the
-    /// single-admin (`Admin` or `ComplianceOfficer`) check, and `Admin`
-    /// retains all admin-only operations. The signer set only governs its own
-    /// membership and threshold. See [`SignerSet`].
+    /// Installing a signer set switches the contract into multisig mode for
+    /// denylist mutations: `add_to_denylist` / `remove_from_denylist` /
+    /// `remove_multiple_from_denylist` then require `threshold` distinct
+    /// signer approvals instead of the single-admin (`Admin` or
+    /// `ComplianceOfficer`) check. `Admin` retains all admin-only operations.
+    /// See [`SignerSet`].
     pub fn initialize_multisig(
         env: Env,
         admin: Address,
@@ -1007,6 +1271,39 @@ impl DenylistGate {
                 }
                 .publish(env);
             }
+            SignerAction::DenyAdd(address) => {
+                // Approved by the signer set: record the entry with the
+                // contract itself as the approver.
+                Self::record_entry(env, &env.current_contract_address(), &address, None);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::DeniedSource(address.clone()));
+                DenyAdd {
+                    address: address.clone(),
+                    by: env.current_contract_address(),
+                }
+                .publish(env);
+                Self::record_audit(
+                    env,
+                    Symbol::new(env, "deny_add"),
+                    &address,
+                    "address added to denylist",
+                );
+            }
+            SignerAction::DenyRemove(address) => {
+                Self::remove_entry(env, &address);
+                DenyRemove {
+                    address: address.clone(),
+                    by: env.current_contract_address(),
+                }
+                .publish(env);
+                Self::record_audit(
+                    env,
+                    Symbol::new(env, "deny_remove"),
+                    &address,
+                    "address removed from denylist",
+                );
+            }
         }
         Ok(())
     }
@@ -1023,6 +1320,24 @@ impl DenylistGate {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    /// Authorizes a denylist mutation.
+    ///
+    /// Returns `Ok(Some(set))` when multisig mode is enabled, in which case
+    /// `caller` has been verified as a current signer and the caller must
+    /// route the mutation through [`Self::approve`]. Returns `Ok(None)` in
+    /// single-admin mode after verifying `caller` is the `Admin` or
+    /// `ComplianceOfficer`.
+    fn require_denylist_authority(
+        env: &Env,
+        caller: &Address,
+    ) -> Result<Option<SignerSet>, Error> {
+        if env.storage().instance().has(&DataKey::SignerSet) {
+            return Self::require_signer(env, caller).map(Some);
+        }
+        Self::require_compliance_authority(env, caller)?;
+        Ok(None)
     }
 
     fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -1069,6 +1384,93 @@ impl DenylistGate {
                 .publish(env);
             }
         }
+    }
+
+    /// Adjust the denylist counter by one. Saturates at the bounds so a
+    /// bookkeeping mismatch can never wrap around.
+    fn bump_denylist_count(env: &Env, increment: bool) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DenylistCount)
+            .unwrap_or(0);
+        let updated = if increment {
+            count.saturating_add(1)
+        } else {
+            count.saturating_sub(1)
+        };
+        env.storage().instance().set(&DataKey::DenylistCount, &updated);
+    }
+
+    /// Whether `address` is currently denylisted.
+    fn is_denied(env: &Env, address: &Address) -> bool {
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, DenyEntry>(&DataKey::DenyEntry(address.clone()))
+        {
+            return match entry.expires_at_ledger {
+                Some(until) => env.ledger().sequence() < until,
+                None => true,
+            };
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::Denied(address.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Record `address` as denylisted with the given expiry. An existing
+    /// `DenyEntry` keeps its original `added_at`/`added_by`; a new one is
+    /// stamped with the current ledger time and `by`. The expiry is always
+    /// replaced. Any legacy flag for the address is dropped, since the
+    /// `DenyEntry` supersedes it.
+    fn record_entry(
+        env: &Env,
+        by: &Address,
+        address: &Address,
+        expires_at_ledger: Option<u32>,
+    ) {
+        const MAX_TTL: u32 = compliance_ttl::DENYLIST_ENTRY_TTL_EXTEND_TO;
+        const THRESHOLD: u32 = compliance_ttl::DENYLIST_ENTRY_TTL_THRESHOLD;
+
+        let key = DataKey::DenyEntry(address.clone());
+        let mut entry = match env.storage().persistent().get::<DataKey, DenyEntry>(&key) {
+            Some(existing) => existing,
+            None => {
+                Self::bump_denylist_count(env, true);
+                DenyEntry {
+                    added_at: env.ledger().timestamp(),
+                    added_by: by.clone(),
+                    expires_at_ledger: None,
+                }
+            }
+        };
+        entry.expires_at_ledger = expires_at_ledger;
+        env.storage().persistent().set(&key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, THRESHOLD, MAX_TTL);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Denied(address.clone()));
+    }
+
+    /// Remove `address` from the denylist, whether it is stored as a
+    /// `DenyEntry` or as a legacy flag. Only a `DenyEntry` was counted, so
+    /// only that removal decrements `denylist_count`.
+    fn remove_entry(env: &Env, address: &Address) {
+        let key = DataKey::DenyEntry(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            Self::bump_denylist_count(env, false);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Denied(address.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DeniedSource(address.clone()));
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {

@@ -66,6 +66,106 @@ For `jurisdiction-flag.is_permitted_jurisdiction(address, allowed_codes)` you
 would pass two arguments: an `address` ScVal and a `vec<string>` ScVal.
 For `circuit-breaker.is_frozen()` you would pass no arguments at all.
 
+## Wallet integration
+
+Wallets should call the read-only views **before** building a transfer, then
+surface any compliance error to the user. The full walkthrough lives in
+[`docs/wallet-integration.md`](../../docs/wallet-integration.md); the code
+below is the condensed version, starting from
+[`check.ts`](./check.ts).
+
+### 1. Pre-transfer view calls
+
+Call these views (all read-only, so simulate — no signing or fees) before
+constructing a transfer:
+
+| Contract | View | Purpose |
+| --- | --- | --- |
+| `denylist-gate` | `check(address)` | Is the sender/recipient allowed? |
+| `jurisdiction-flag` | `is_permitted_jurisdiction(address, allowed_codes)` | Is the counterparty in an allowed jurisdiction? |
+| `circuit-breaker` | `is_frozen()` | Has the contract been paused? |
+
+```ts
+import { Contract, nativeToScVal, scValToNative, TransactionBuilder } from "@stellar/stellar-sdk";
+
+async function preTransferChecks(
+  server: SorobanRpc.Server,
+  source: Account,
+  denylistGateId: string,
+  jurisdictionFlagId: string,
+  circuitBreakerId: string,
+  sender: string,
+  recipient: string,
+  allowedCodes: string[],
+) {
+  // 1. Circuit breaker — bail out early if the contract is paused.
+  const frozen = await simulate(server, source, circuitBreakerId, "is_frozen", []);
+  if (frozen) throw new ComplianceError("CONTRACT_FROZEN", "Transfers are paused");
+
+  // 2. Denylist gate — both parties must pass.
+  for (const addr of [sender, recipient]) {
+    const allowed = await simulate(server, source, denylistGateId, "check", [
+      nativeToScVal(addr, { type: "address" }),
+    ]);
+    if (!allowed) throw new ComplianceError("DENIED", `${addr} is on the denylist`);
+  }
+
+  // 3. Jurisdiction flag — recipient must be in an allowed jurisdiction.
+  const permitted = await simulate(server, source, jurisdictionFlagId, "is_permitted_jurisdiction", [
+    nativeToScVal(recipient, { type: "address" }),
+    nativeToScVal(allowedCodes, { type: "vec" }),
+  ]);
+  if (!permitted) throw new ComplianceError("JURISDICTION", `${recipient} is not permitted`);
+}
+
+// Shared helper: build a read-only tx, simulate it, decode the result.
+async function simulate(
+  server: SorobanRpc.Server,
+  source: Account,
+  contractId: string,
+  fn: string,
+  args: xdr.ScVal[],
+) {
+  const contract = new Contract(contractId);
+  const tx = new TransactionBuilder(source, { fee: "100", networkPassphrase: Networks.TESTNET })
+    .addOperation(contract.call(fn, ...args))
+    .setTimeout(30)
+    .build();
+  const sim = await server.simulateTransaction(tx);
+  if (SorobanRpc.Api.isSimulationError(sim)) throw new Error(sim.error);
+  return scValToNative(sim.result!.retval);
+}
+```
+
+### 2. Handling compliance errors
+
+When a view returns `false` (or the contract traps), do **not** build the
+transfer. Map the failure to a user-facing message and a stable error code so
+the UI can render it consistently:
+
+```ts
+class ComplianceError extends Error {
+  constructor(public code: "DENIED" | "JURISDICTION" | "CONTRACT_FROZEN", message: string) {
+    super(message);
+  }
+}
+
+try {
+  await preTransferChecks(/* ... */);
+  // Safe to build and submit the transfer here.
+} catch (err) {
+  if (err instanceof ComplianceError) {
+    // e.g. show a banner: "Transfer blocked: <message>"
+    showComplianceBanner(err.code, err.message);
+  } else {
+    throw err;
+  }
+}
+```
+
+See [`docs/wallet-integration.md`](../../docs/wallet-integration.md) for the
+full guide, including error-code reference and UI guidance.
+
 ## Relation to `tools/indexer`
 
 [`tools/indexer`](../../tools/indexer) is a long-running event indexer that

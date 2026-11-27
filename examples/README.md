@@ -25,6 +25,8 @@ to find the right starting point for your use case.
 | [`rwa-compliance-flow`](./rwa-compliance-flow) | `allowlist-token`, `denylist-gate`, `jurisdiction-flag` | Integration test for the full compliance stack: all three primitives evaluated in series with specific per-gate error handling |
 | [`rwa-token`](./rwa-token) | `allowlist-token`, `denylist-gate`, `jurisdiction-flag`, `circuit-breaker` | Reference RWA token composing all four core primitives in one `transfer` path; the most complete production-like example (testnet deployment available) |
 | [`rwa-token-aggregator`](./rwa-token-aggregator) | `compliance-aggregator`, `denylist-gate`, `jurisdiction-flag`, `circuit-breaker` | RWA token whose `transfer` calls only `compliance-aggregator.check_address`; the aggregator is the single top-level gate composing denylist, jurisdiction and circuit-breaker |
+| [`stablecoin-sanctions-sync`](./stablecoin-sanctions-sync) | `denylist-gate`, `denylist-gate-sep41` | Stablecoin gated by a denylist, kept in sync with an off-chain sanctions list via a shell script; shows the on-chain/off-chain loop used with [compliance-adapters](https://github.com/stellar-compliance-kit/compliance-adapters) |
+| [`tokenized-fund`](./tokenized-fund) | `allowlist-token`, `jurisdiction-flag`, `circuit-breaker` | Tokenized fund share gated by circuit-breaker, allowlist and jurisdiction checks in one `transfer` path; issuer-gated `mint` |
 
 ## Which example should I start with?
 

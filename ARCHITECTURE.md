@@ -4,7 +4,8 @@ This document describes how the nine contract crates under `contracts/` fit
 together: what each one is for, which category it falls into, and which
 other contracts it calls into or is called by. For the security invariants
 and threat model of each contract, see [`SPEC.md`](SPEC.md). For the on-chain
-event schema, see [`EVENTS.md`](EVENTS.md).
+event schema, see [`EVENTS.md`](EVENTS.md). For runnable call-flow diagrams of
+common setups, see [`docs/PRIMITIVE_COMPOSITION.md`](docs/PRIMITIVE_COMPOSITION.md).
 
 ## Compose, don't inherit
 
@@ -56,7 +57,7 @@ workspace at the crate level.
 | Contract | Job | Called by |
 |---|---|---|
 | `denylist-gate` | `check(address) -> bool` — is this address blocked? | consumer contracts, `compliance-aggregator`, `policy-engine` |
-| `allowlist-token` | Wraps a SEP-41 token; only forwards `transfer` between two allowlisted addresses | end users / wallets directly (it's the one primitive meant to sit in the call path itself, not be queried by another contract) |
+| `allowlist-token` | Wraps a SEP-41 token; only forwards `transfer` between two allowlisted addresses, and exposes `is_allowed(address)` for composition | end users / wallets directly, `compliance-aggregator`, and `policy-engine` |
 | `jurisdiction-flag` | `is_permitted_jurisdiction(address, allowed_codes) -> bool` | consumer contracts, `compliance-aggregator`, `policy-engine` |
 | `audit-log` | Append-only on-chain event trail: `record(source, kind, subject, detail)` | opt-in — a primitive that has been wired with `set_audit_log(admin, audit_log_id)` calls it after each mutating operation. Currently wired into `denylist-gate`'s design and `circuit-breaker`'s `freeze`/`unfreeze`; not yet wired into `allowlist-token` or `jurisdiction-flag` |
 
@@ -84,8 +85,8 @@ decision. Both call into the primitive layer; neither calls the other.
 
 | Contract | Job | Composes |
 |---|---|---|
-| `compliance-aggregator` | Registers at most one `denylist-gate` and one `jurisdiction-flag` address; `check_address`/`check_all` AND-combine their results into a single call with a per-check breakdown | `denylist-gate.check`, `jurisdiction-flag.is_permitted_jurisdiction` |
-| `policy-engine` | Registers an arbitrary, admin-managed list of `CheckKind` entries (each naming a target contract + params) plus a `CombineOp` (`All` = AND, `Any` = OR); `evaluate(from, to)` runs every check against both addresses | `denylist-gate.check`, `jurisdiction-flag.is_permitted_jurisdiction` (same two primitive interfaces as the aggregator, via its own generated clients) |
+| `compliance-aggregator` | Registers denylist, jurisdiction, and allowlist sources; `check_address`/`check_all` AND-combine results, with verbose variants returning failure details | `denylist-gate.check`, `jurisdiction-flag.is_permitted_jurisdiction`, `allowlist-token.is_allowed` |
+| `policy-engine` | Registers an arbitrary, admin-managed list of `CheckKind` entries (each naming a target contract + params) plus a `CombineOp` (`All` = AND, `Any` = OR); `evaluate(from, to)` runs every check against both addresses | `denylist-gate.check`, `jurisdiction-flag.is_permitted_jurisdiction`, `allowlist-token.is_allowed` |
 
 The two are deliberately not merged. `compliance-aggregator` is the simpler,
 fixed-shape tool (always AND, always these two checks) for the common case;
@@ -95,9 +96,9 @@ shape moves to the policy engine rather than the aggregator growing a second
 mode. See the "Relationship to #109" note in `compliance-aggregator`'s
 module doc comment for the original design discussion.
 
-Neither composition contract currently calls into `allowlist-token` — both
-treat it as the deploy-in-front-of-a-token primitive that consumers use
-directly, not as a queryable check.
+Both composition contracts can query `allowlist-token.is_allowed(address)`.
+The token wrapper remains independently usable for integrations that prefer
+to enforce allowlisting at the token boundary.
 
 ### Shared library: `pausable`
 

@@ -37,6 +37,14 @@ memory = 1
 cpu = 1500000
 memory = 400000
 
+# check_address with an admin-configured check order that runs the cheapest
+# check first (fail-fast path). Measured by
+# `cargo test -p compliance-aggregator budget_regression_ordered -- --nocapture`.
+# CI fails if either value regresses by more than 10%.
+[compliance-aggregator.check_address_ordered]
+cpu = 1500000
+memory = 400000
+
 # multisig-admin's hottest entrypoint: `__check_auth` runs on every admin
 # operation of every primitive that uses the multisig as its admin.
 # Measured with a 2-of-3 signer set and two approving signatures

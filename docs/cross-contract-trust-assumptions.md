@@ -181,7 +181,7 @@ checks.
 
 ### 6. `compliance-aggregator` → `denylist-gate` (`DenylistGateClient`)
 
-**Contract:** `compliance-aggregator/src/lib.rs`  
+**Contract:** `compliance-aggregator/src/lib.rs**
 **Interface:** `DenylistGateClient` (`check(address) -> bool`)
 
 **When called:** In `check_address`, `check_all`, and `batch_check`, for
@@ -252,6 +252,30 @@ pre-check via the private `is_frozen` helper.
 
 ---
 
+### 9. `compliance-aggregator` → `allowlist-token` (`AllowlistTokenClient`)
+
+**Contract:** `compliance-aggregator/src/lib.rs`
+
+**Interface:** `AllowlistTokenClient` (`is_allowed(address) -> bool`)
+
+**When called:** In `check_address`, `check_all`, and `batch_check`, for
+every address evaluated when an allowlist address is configured.
+
+**Trust assumption:**
+> Admin-controlled via `set_allowlist(admin, allowlist)`. The aggregator
+> trusts the registered contract's response as the allowlist decision.
+
+**Reentrancy analysis:** Low (read-only evaluation).
+
+**Malicious-callee scenario:**
+- Always allowed → allowlist restriction bypass.
+- Always denied or panic → legitimate addresses are blocked or evaluation
+  fails.
+- **Worst case:** Compliance bypass or denial of service.
+- **Mitigation:** Verify the registered deployment and admin governance.
+
+---
+
 ## Summary Table
 
 | Caller | Callee | Call | Reentrancy Risk | Malicious-Callee Worst Case | Trust Root |
@@ -264,6 +288,7 @@ pre-check via the private `is_frozen` helper.
 | `compliance-aggregator` | `denylist-gate` | `check()` | Low | Compliance bypass or DoS | Admin (`set_denylist_gate`) |
 | `compliance-aggregator` | `jurisdiction-flag` | `try_is_permitted_jurisdiction()` | Low | Compliance bypass (panic = fail) | Admin (`set_jurisdiction_flag`) |
 | `compliance-aggregator` | `circuit-breaker` | `is_frozen()` | Negligible | DoS of all evaluations | Admin (`set_circuit_breaker`) |
+| `compliance-aggregator` | `allowlist-token` | `is_allowed()` | Low | Compliance bypass or DoS | Admin (`set_allowlist`) |
 
 ---
 

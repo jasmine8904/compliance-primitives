@@ -57,14 +57,20 @@ use super::test_utils::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Register and initialize a policy-engine with the given `op`.
-/// Returns `(admin, client)`.
-fn setup_engine(env: &Env, op: CombineOp) -> (Address, PolicyEngineClient<'_>) {
+/// Register and initialize a policy-engine with the given `op`, then create a
+/// named policy for the benchmarks to register checks against.
+/// Returns `(admin, client, policy_name)`.
+fn setup_engine(
+    env: &Env,
+    op: CombineOp,
+) -> (Address, PolicyEngineClient<'_>, String) {
     let admin = Address::generate(env);
     let id = env.register(PolicyEngine, ());
     let client = PolicyEngineClient::new(env, &id);
     client.initialize(&admin, &op, &None);
-    (admin, client)
+    let name = String::from_str(env, "bench");
+    client.create_policy(&admin, &name, &op);
+    (admin, client, name)
 }
 
 /// Register a mock denylist, optionally adding `address` to it.
@@ -113,18 +119,19 @@ fn bench_all_best_case_short_circuit() {
     // Check 2 (second denylist): neither party denied, but never reached.
     let deny2 = make_denylist(&env, None);
 
-    let (admin, client) = setup_engine(&env, CombineOp::All);
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
+    let (admin, client, name) = setup_engine(&env, CombineOp::All);
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri1,
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(!result, "expected false: first check fails for `from`");
 
     std::println!(
@@ -150,18 +157,19 @@ fn bench_all_worst_case_full_evaluation() {
         .set_jurisdiction(&to, &String::from_str(&env, "US"));
     let deny2 = make_denylist(&env, None);
 
-    let (admin, client) = setup_engine(&env, CombineOp::All);
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
+    let (admin, client, name) = setup_engine(&env, CombineOp::All);
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri1,
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(result, "expected true: all checks pass");
 
     std::println!(
@@ -196,18 +204,19 @@ fn bench_any_best_case_short_circuit() {
     // Check 2 (denylist): would also pass, but never reached.
     let deny2 = make_denylist(&env, None);
 
-    let (admin, client) = setup_engine(&env, CombineOp::Any);
+    let (admin, client, name) = setup_engine(&env, CombineOp::Any);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri0,
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(result, "expected true: first check passes for both addresses");
 
     std::println!(
@@ -237,18 +246,19 @@ fn bench_any_worst_case_full_evaluation() {
     // Check 2 (denylist): `to` denied → fails.
     let deny2 = make_denylist(&env, Some(&to));
 
-    let (admin, client) = setup_engine(&env, CombineOp::Any);
+    let (admin, client, name) = setup_engine(&env, CombineOp::Any);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri0,
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(!result, "expected false: all checks fail");
 
     std::println!(
@@ -274,10 +284,10 @@ fn bench_single_check_baseline() {
 
     let deny0 = make_denylist(&env, None); // neither address denied → passes
 
-    let (admin, client) = setup_engine(&env, CombineOp::All);
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
+    let (admin, client, name) = setup_engine(&env, CombineOp::All);
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(result, "expected true: single denylist check passes");
 
     std::println!(
@@ -315,18 +325,18 @@ fn bench_short_circuit_order_matters_all() {
     // denylist B: `to` denied (would short-circuit second).
     let deny_b = make_denylist(&env, Some(&to));
 
-    let (admin, client) = setup_engine(&env, CombineOp::All);
+    let (admin, client, name) = setup_engine(&env, CombineOp::All);
 
     // Order: A first, B second.
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny_a.clone() }));
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny_b.clone() }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny_a.clone() }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny_b.clone() }));
 
     // With A first: short-circuits on `from` check in A → false.
-    let result_ab = client.evaluate(&from, &to);
+    let result_ab = client.evaluate_policy(&name, &from, &to);
     assert!(!result_ab);
 
     // Confirm that the get_checks order matches insertion order.
-    let checks = client.get_checks();
+    let checks = client.get_checks(&name);
     assert_eq!(checks.len(), 2);
     match checks.get(0).unwrap() {
         CheckKind::Denylist(DenylistCheck { contract }) => {
@@ -368,12 +378,12 @@ fn bench_verbose_all_reports_first_failing_check() {
     // Check 2 (denylist): would fail too, but never reached.
     let deny2 = make_denylist(&env, Some(&to));
 
-    let (admin, client) = setup_engine(&env, CombineOp::All);
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+    let (admin, client, name) = setup_engine(&env, CombineOp::All);
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
 
-    let failure = client.evaluate_verbose(&from, &to);
+    let failure = client.evaluate_verbose(&name, &from, &to);
     assert_eq!(failure.check_index, 1, "expected first failing check at index 1");
     assert_eq!(failure.kind, String::from_str(&env, "Denylist"));
 
@@ -402,18 +412,19 @@ fn bench_verbose_any_reports_all_failed_sentinel() {
     // Check 2 (denylist): `to` denied → fails.
     let deny2 = make_denylist(&env, Some(&to));
 
-    let (admin, client) = setup_engine(&env, CombineOp::Any);
+    let (admin, client, name) = setup_engine(&env, CombineOp::Any);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri0,
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
-    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
+    client.add_check(&admin, &name, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
 
-    let failure = client.evaluate_verbose(&from, &to);
+    let failure = client.evaluate_verbose(&name, &from, &to);
     assert_eq!(
         failure.check_index,
         u32::MAX,

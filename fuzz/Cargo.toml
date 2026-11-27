@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 soroban-sdk = { version = "27.0.0", features = ["testutils"] }
 denylist-gate = { path = "../contracts/denylist-gate" }
 jurisdiction-flag = { path = "../contracts/jurisdiction-flag" }
+circuit-breaker = { path = "../contracts/circuit-breaker" }
 
 # Standalone workspace: cargo-fuzz needs nightly and must not join the
 # root workspace's resolver or lockfile.

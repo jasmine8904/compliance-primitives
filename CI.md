@@ -19,7 +19,7 @@ Runs `cargo test --workspace budget_regression`. Catches unintended instruction 
 Builds `cargo build --workspace --target wasm32v1-none --release`. Ensures all contracts compile to valid wasm.
 
 ### wasm size budget
-Runs `scripts/check-wasm-size.sh` (locally: `make check-wasm-size`). Builds every contract listed in `wasm-size-budgets.toml` — including `allowlist-token`, `denylist-gate`, and `jurisdiction-flag` — to `wasm32v1-none` and fails if a binary exceeds its recorded baseline by more than 10%. On failure it names the contract and reports how many bytes it is over its limit and its baseline. See the header of `wasm-size-budgets.toml` for the budget rationale and how to update a baseline.
+Runs `scripts/check-wasm-size.sh` (locally: `make check-wasm-size`). Builds every contract listed in `wasm-size-budgets.toml` — including `allowlist-token`, `denylist-gate`, and `jurisdiction-flag` — to `wasm32v1-none` and fails if a binary exceeds its recorded baseline by more than 10%. On failure it names the contract and reports how many bytes it is over its limit and its baseline. On pull requests from this repo, a per-contract size table (size, baseline, delta, limit) is posted as a PR comment, updated in place on each push. See the header of `wasm-size-budgets.toml` for the budget rationale and how to update a baseline.
 
 ### cargo deny check
 Runs `cargo-deny` to check for:
@@ -31,7 +31,14 @@ Runs `cargo-deny` to check for:
 ### cargo semver-checks
 Runs `cargo-semver-checks check-release` against publishable crates to catch accidental breaking API changes before merge.
 
-**Scope:** Currently checks `compliance-pausable` (the primary shared/publishable crate). Add `--package` flags when additional crates become public.
+**Scope:**
+- `semver-checks` checks `compliance-pausable` against its crates.io baseline (the one published crate).
+- `semver-checks-contracts` runs one matrix job per contract crate in `contracts/` (all `publish = false`). It compares against `git merge-base HEAD origin/main` via `--baseline-rev`, since there is no registry baseline. A contract added in a PR fails this job until it exists on main, at which point add it to the matrix.
+
+Examples in `examples/` are not checked: they are consumer demos, not libraries that others depend on.
+
+### docs/ERRORS.md up to date
+Runs `python3 scripts/generate-errors-docs.py` and fails if `docs/ERRORS.md` differs from the committed copy. Ensures the combined error code reference (generated from every `Error` enum in `contracts/` and `examples/`) stays in sync with the source. Locally: `make check-errors-docs`.
 
 ## Scheduled Jobs (.github/workflows/scheduled-deny.yml)
 

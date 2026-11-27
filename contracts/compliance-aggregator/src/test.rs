@@ -29,26 +29,61 @@ use circuit_breaker::{CircuitBreaker, CircuitBreakerClient as CbClient};
 use denylist_gate::{DenylistGate, DenylistGateClient};
 use jurisdiction_flag::{JurisdictionFlag, JurisdictionFlagClient};
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{vec, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Env, String};
+
+#[contracttype]
+#[derive(Clone)]
+enum MockAllowlistKey {
+    Allowed(Address),
+}
+
+#[contract]
+pub struct MockAllowlist;
+
+#[contractimpl]
+impl MockAllowlist {
+    pub fn set_allowed(env: Env, address: Address, allowed: bool) {
+        env.storage().instance().set(&MockAllowlistKey::Allowed(address), &allowed);
+    }
+
+    pub fn is_allowed(env: Env, address: Address) -> bool {
+        env.storage().instance().get(&MockAllowlistKey::Allowed(address)).unwrap_or(false)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
+#[contract]
+pub struct MockAllowlist;
+
+#[contracttype]
+#[derive(Clone)]
+enum MockAllowlistKey {
+    Allowed(Address),
+}
+
+#[contractimpl]
+impl MockAllowlist {
+    pub fn set_allowed(env: Env, address: Address, allowed: bool) {
+        env.storage()
+            .instance()
+            .set(&MockAllowlistKey::Allowed(address), &allowed);
+    }
+
+    pub fn is_allowed(env: Env, address: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&MockAllowlistKey::Allowed(address))
+            .unwrap_or(false)
+    }
+}
+
 /// Registers and initialises both underlying primitives plus the aggregator.
 /// Returns `(gate_admin, gate_id, flag_issuer, flag_id, agg_admin, agg_id, agg_client)`.
 #[allow(clippy::type_complexity)]
-fn setup_all(
-    env: &Env,
-) -> (
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-    ComplianceAggregatorClient<'_>,
-) {
+fn setup_all(env: &Env) -> (Address, Address, Address, Address, Address, Address, ComplianceAggregatorClient<'_>) {
     env.mock_all_auths();
 
     // denylist-gate
@@ -67,15 +102,12 @@ fn setup_all(
     let agg_client = ComplianceAggregatorClient::new(env, &agg_id);
     agg_client.initialize(&agg_admin, &Some(gate_id.clone()), &Some(flag_id.clone()), &None);
 
-    (
-        gate_admin, gate_id, flag_issuer, flag_id, agg_admin, agg_id, agg_client,
-    )
+    (gate_admin, gate_id, flag_issuer, flag_id, agg_admin, agg_id, agg_client)
 }
 
 /// Helper: sets `address` jurisdiction to `code` via the flag contract.
 fn set_jurisdiction(env: &Env, flag_id: &Address, issuer: &Address, address: &Address, code: &str) {
-    JurisdictionFlagClient::new(env, flag_id)
-        .set_jurisdiction(issuer, address, &String::from_str(env, code));
+    JurisdictionFlagClient::new(env, flag_id).set_jurisdiction(issuer, address, &String::from_str(env, code));
 }
 
 /// Helper: adds `address` to the denylist.
@@ -97,6 +129,7 @@ fn test_initialize_stores_gate_and_flag() {
     let (_, gate_id, _, flag_id, _, _, client) = setup_all(&env);
     assert_eq!(client.denylist_gate(), Some(gate_id));
     assert_eq!(client.jurisdiction_flag(), Some(flag_id));
+    assert_eq!(client.get_checks_summary(), (true, true, false, false));
 }
 
 #[test]
@@ -129,11 +162,11 @@ fn test_get_checks_summary_reports_configured_checks() {
     let client = ComplianceAggregatorClient::new(&env, &agg_id);
     client.initialize(&agg_admin, &Some(gate_id.clone()), &Some(flag_id.clone()), &None);
 
-    assert_eq!(client.get_checks_summary(), (true, true));
+    assert_eq!(client.get_checks_summary(), (true, true, false, false));
 
     let client_without_flag = ComplianceAggregatorClient::new(&env, &agg_id);
     // Re-initialize is not permitted; verify the summary is still a view over storage.
-    assert_eq!(client_without_flag.get_checks_summary(), (true, true));
+    assert_eq!(client_without_flag.get_checks_summary(), (true, true, false, false));
 }
 
 #[test]
@@ -218,6 +251,16 @@ fn test_set_jurisdiction_flag_rejects_non_admin() {
     let impostor = Address::generate(&env);
     let flag2_id = env.register(JurisdictionFlag, ());
     let result = client.try_set_jurisdiction_flag(&impostor, &flag2_id);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+}
+
+#[test]
+fn test_set_allowlist_rejects_non_admin() {
+    let env = Env::default();
+    let (_, _, _, _, _, _, client) = setup_all(&env);
+    let impostor = Address::generate(&env);
+    let allowlist = Address::generate(&env);
+    let result = client.try_set_allowlist(&impostor, &allowlist);
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
 }
 
@@ -495,9 +538,8 @@ fn test_zero_checks_is_documented_error_not_panic() {
 
     let addr = Address::generate(&env);
     // Must not panic: try_* surfaces the error as a Result.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.try_check_address(&addr, &vec![&env])
-    }));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.try_check_address(&addr, &vec![&env])));
     assert!(result.is_ok(), "check_address must not panic on zero checks");
     assert_eq!(result.unwrap(), Err(Ok(Error::NoChecksRegistered)));
 }
@@ -514,9 +556,7 @@ fn test_zero_checks_is_documented_error_not_panic() {
 fn test_and_composition_exhaustive_truth_table() {
     let env = Env::default();
 
-    for (deny_alice, right_jurisdiction) in
-        [(false, true), (false, false), (true, true), (true, false)]
-    {
+    for (deny_alice, right_jurisdiction) in [(false, true), (false, false), (true, true), (true, false)] {
         let (gate_admin, gate_id, flag_issuer, flag_id, _, _, client) = setup_all(&env);
         let alice = Address::generate(&env);
 
@@ -638,6 +678,54 @@ fn test_check_all_no_checks_registered() {
     let alice = Address::generate(&env);
     let result = client.try_check_all(&vec![&env, alice], &vec![&env]);
     assert_eq!(result, Err(Ok(Error::NoChecksRegistered)));
+}
+
+#[test]
+fn test_allowlist_check_address_batch_and_summary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let allowlist_id = env.register(MockAllowlist, ());
+    let allowlist = MockAllowlistClient::new(&env, &allowlist_id);
+
+    let admin = Address::generate(&env);
+    let aggregator_id = env.register(ComplianceAggregator, ());
+    let client = ComplianceAggregatorClient::new(&env, &aggregator_id);
+    client.initialize(&admin, &None, &None, &None);
+    client.set_allowlist(&admin, &allowlist_id);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    allowlist.set_allowed(&alice, &true);
+
+    assert_eq!(client.allowlist_token(), Some(allowlist_id.clone()));
+    assert_eq!(client.get_checks_summary(), (false, false, false, true));
+
+    let (alice_passed, alice_checks) = client.check_address(&alice, &vec![&env]);
+    assert!(alice_passed);
+    assert!(alice_checks.get(0).unwrap().passed);
+
+    let (bob_passed, _bob_checks) = client.check_address(&bob, &vec![&env]);
+    assert!(!bob_passed);
+    let (_, bob_failures) = client.check_address_with_failures(&bob, &vec![&env]);
+    assert_eq!(
+        bob_failures,
+        vec![&env, CheckFailure { source: CheckKind::Allowlist, code: CheckFailureCode::NotAllowlisted },]
+    );
+
+    let batch = client.check_all(&vec![&env, alice.clone(), bob.clone()], &vec![&env]);
+    assert!(batch.get(0).unwrap().all_passed);
+    let detailed_batch = client.check_all_with_failures(&vec![&env, alice.clone(), bob.clone()], &vec![&env]);
+    assert_eq!(
+        detailed_batch.get(1).unwrap().failures,
+        vec![&env, CheckFailure { source: CheckKind::Allowlist, code: CheckFailureCode::NotAllowlisted },]
+    );
+
+    assert_eq!(client.batch_check(&vec![&env, alice, bob], &vec![&env]), vec![&env, true, false]);
+
+    client.clear_allowlist(&admin);
+    assert_eq!(client.allowlist_token(), None);
+    assert_eq!(client.get_checks_summary(), (false, false, false, false));
 }
 
 // ---------------------------------------------------------------------------

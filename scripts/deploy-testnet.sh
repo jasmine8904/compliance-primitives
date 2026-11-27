@@ -58,6 +58,63 @@ CONTRACT_ID="$(stellar contract deploy \
 echo "${CONTRACT_ID}"
 
 # ---------------------------------------------------------------------------
+# Record the deployed contract ID for the current release and refresh the
+# README table.
+#
+# The release is read from [workspace.package] version in Cargo.toml unless
+# overridden via $RELEASE. IDs are stored in testnet-ids.json and rendered
+# into README.md by scripts/update-testnet-ids.mjs.
+# ---------------------------------------------------------------------------
+
+record_testnet_id() {
+  local contract_name="$1"
+  local contract_id="$2"
+
+  local release="${RELEASE:-}"
+  if [ -z "$release" ]; then
+    release="$(awk '
+      /^\[workspace\.package\]/ { in_section = 1; next }
+      /^\[/ { in_section = 0 }
+      in_section && /^[[:space:]]*version[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*"/, "")
+        sub(/".*$/, "")
+        print
+        exit
+      }
+    ' Cargo.toml)"
+  fi
+
+  if [ -z "$release" ]; then
+    echo "warning: could not determine release; skipping testnet-ids.json update" >&2
+    return 0
+  fi
+
+  echo "==> Recording ${contract_name} ${contract_id} for release ${release}..."
+  RELEASE="$release" CONTRACT_NAME="$contract_name" CONTRACT_ID="$contract_id" \
+    node -e '
+      const fs = require("fs");
+      const path = "testnet-ids.json";
+      const release = process.env.RELEASE;
+      const name = process.env.CONTRACT_NAME;
+      const id = process.env.CONTRACT_ID;
+      let data = {};
+      if (fs.existsSync(path)) {
+        data = JSON.parse(fs.readFileSync(path, "utf8"));
+      }
+      if (!data[release] || typeof data[release] !== "object") {
+        data[release] = {};
+      }
+      data[release][name] = id;
+      fs.writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
+    '
+
+  echo "==> Refreshing README testnet ID table..."
+  node scripts/update-testnet-ids.mjs
+}
+
+record_testnet_id "$CONTRACT_NAME" "$CONTRACT_ID"
+
+# ---------------------------------------------------------------------------
 # Multisig signer-rotation example (denylist-gate)
 #
 # The single-admin flow above only deploys the contract. The denylist-gate

@@ -595,3 +595,35 @@ fixed per-invocation overhead.
 | 2 (sender + recipient) | Either. `check_all` saves one aggregator frame, 3 reads and one breaker call. This is small next to the 4 downstream calls both paths make. |
 | 5–10 | `check_all`, or `batch_check` if per-check detail isn't needed. |
 | 25–45 | `batch_check`, which enforces `MAX_BATCH_SIZE` = 45. `check_all` has no size cap, and its per-address breakdown dominates memory at this size. Split larger batches across transactions. |
+
+## Per-entry-point cost table
+
+Regression baselines for each contract entry point, generated from
+`budget-baselines.toml` by `scripts/gen-cost-table.py`. Do not edit the table by
+hand. CI regenerates it and fails if the committed copy is stale, so the table
+tracks the baselines release by release (history is in git).
+
+- **CPU / Memory**: the values the `budget_regression` tests enforce (fail above +10%).
+- **Read / Write**: not recorded by the harness yet; shown as "—" until a baseline sets them.
+- **not measured**: the baseline is still the placeholder `1`.
+
+To estimate fees, see [Fee Impact on Stellar](#fee-impact-on-stellar), or run
+`stellar contract invoke ... --cost` on a deployed contract.
+
+<!-- cost-table:start -->
+| Contract | Entry point | CPU instructions | Memory (bytes) | Read (bytes) | Write (bytes) |
+|---|---|---:|---:|---:|---:|
+| `allowlist-token` | `transfer` | not measured | not measured | — | — |
+| `allowlist-token` | `add_to_allowlist` | not measured | not measured | — | — |
+| `allowlist-token` | `add_to_allowlist_delegated` | not measured | not measured | — | — |
+| `denylist-gate` | `check` | not measured | not measured | — | — |
+| `denylist-gate` | `add_to_denylist_without_audit_log` | not measured | not measured | — | — |
+| `denylist-gate` | `add_to_denylist_with_audit_log` | not measured | not measured | — | — |
+| `jurisdiction-flag` | `is_permitted_jurisdiction` | not measured | not measured | — | — |
+| `policy-engine` | `evaluate` | not measured | not measured | — | — |
+| `compliance-aggregator` | `check_address` | 1,500,000 | 400,000 | — | — |
+| `multisig-admin` | `__check_auth` | 250,000 | 40,000 | — | — |
+| `audit-log` | `record` | not measured | not measured | — | — |
+| `circuit-breaker` | `is_frozen` | not measured | not measured | — | — |
+<!-- cost-table:end -->
+

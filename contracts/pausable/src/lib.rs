@@ -70,6 +70,43 @@
 //! circuit-breaker contract itself. The two mechanisms are kept separate to
 //! avoid conflating operational pause (admin maintenance window) with
 //! emergency freeze (halt-all-transfers signal).
+//!
+//! ## Pauser role: hot/cold key separation (issue #806)
+//!
+//! Requiring the admin key to pause slows incident response: the admin key is
+//! typically a cold key (hardware wallet, multisig, or offline signer) and
+//! bringing it online mid-incident is slow. This crate therefore supports an
+//! optional **pauser** role — a hot key that can *only* pause, never unpause.
+//!
+//! - [`set_pauser`] / [`clear_pauser`] are **admin-only** operations. The
+//!   consuming contract must authenticate the admin before calling them; this
+//!   crate does not know the admin `Address`.
+//! - [`pause_authorized`] lets a caller pause when it is either the admin or
+//!   the configured pauser.
+//! - [`unpause`] remains **admin-only** — the pauser can never resume the
+//!   contract, so a compromised hot key can halt operations but cannot
+//!   unilaterally restore them.
+//!
+//! ### Recommended key setup
+//!
+//! | Key | Storage | Purpose |
+//! |---|---|---|
+//! | Admin | cold (multisig / hardware / offline) | Unpause, rotate or clear the pauser, all other privileged ops |
+//! | Pauser | hot (server-side signer, on-call automation) | Pause only |
+//!
+//! Operational guidance:
+//!
+//! 1. Keep the admin key cold and use it only for unpause, pauser rotation,
+//!    and other privileged configuration.
+//! 2. Assign the pauser key to on-call automation or a monitoring service so
+//!    an incident can be halted within seconds.
+//! 3. Rotate the pauser key after any incident, or immediately if it may have
+//!    been compromised, via [`set_pauser`] (or [`clear_pauser`] to remove the
+//!    role entirely).
+//! 4. Because the pauser cannot unpause, a compromised pauser key can only
+//!    cause a denial of service that the cold admin key can recover from.
+//!
+//! A [`PauserChanged`] event is emitted whenever the pauser is set or cleared.
 #![no_std]
 
 use soroban_sdk::{contractmeta, contracttype, Env, String};
@@ -95,6 +132,83 @@ enum DataKey {
     /// last paused via [`pause_with_reason`].  Absent when no reason was
     /// supplied or the contract is not paused.
     PauseReason,
+    /// Optional ledger timestamp at which an automatic pause expires.
+    /// Absent for pauses created by [`pause`] / [`pause_with_reason`].
+    PauseUntil,
+    /// Scopes currently paused independently of the global flag (#805).
+    PausedScopes,
+    /// Optional hot key allowed to pause (but not unpause) the contract.
+    Pauser,
+}
+
+///Feature-level pause scope (#805). A global pause overrides every scope.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseScope {
+    /// Minting / issuance operations.
+    Mint,
+    /// Redemption / withdrawal operations.
+    Redeem,
+    /// Transfers between accounts.
+    Transfer,
+    /// Administrative configuration changes.
+    Admin,
+}
+
+fn active_scopes(env: &Env) -> soroban_sdk::Vec<PauseScope> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PausedScopes)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Pause a single feature while other features remain operational.
+pub fn pause_scope(env: &Env, scope: PauseScope) {
+    let mut scopes = active_scopes(env);
+    if !scopes.contains(scope.clone()) {
+        scopes.push_back(scope);
+        env.storage().instance().set(&DataKey::PausedScopes, &scopes);
+    }
+}
+
+/// Resume a previously paused feature. The global pause is unaffected.
+pub fn unpause_scope(env: &Env, scope: PauseScope) {
+    let scopes = active_scopes(env);
+    let mut remaining = soroban_sdk::Vec::new(env);
+    for current in scopes.iter() {
+        if current != scope {
+            remaining.push_back(current);
+        }
+    }
+    if remaining.is_empty() {
+        env.storage().instance().remove(&DataKey::PausedScopes);
+    } else {
+        env.storage().instance().set(&DataKey::PausedScopes, &remaining);
+    }
+}
+
+/// Returns `true` when the contract is globally paused or `scope` is paused.
+///
+/// A global pause overrides every scope, so callers guarding a specific
+/// feature with [`require_not_paused_scope`] also stop during a full stop.
+pub fn is_paused_scope(env: &Env, scope: PauseScope) -> bool {
+    is_paused(env) || active_scopes(env).contains(scope)
+}
+
+/// Panic if the contract is globally paused or `scope` is paused.
+pub fn require_not_paused_scope(env: &Env, scope: PauseScope) {
+    if is_paused_scope(env, scope) {
+        panic!("contract is paused");
+    }
+}
+
+/// Return `Err(err)` if the contract is globally paused or `scope` is paused.
+pub fn require_not_paused_scope_or<E>(env: &Env, scope: PauseScope, err: E) -> Result<(), E> {
+    if is_paused_scope(env, scope) {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 /// Returns `true` if the contract is currently paused.
@@ -102,10 +216,20 @@ enum DataKey {
 /// Defaults to `false` when no pause flag has been stored yet, so a freshly
 /// initialized contract starts in the active (unpaused) state.
 pub fn is_paused(env: &Env) -> bool {
-    env.storage()
+    let paused: bool = env
+        .storage()
         .instance()
         .get(&DataKey::Paused)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !paused {
+        return false;
+    }
+    // An incident pause with an expiry stops being effective once the ledger
+    // clock reaches `until` — no explicit unpause required (#804).
+    match env.storage().instance().get::<_, u64>(&DataKey::PauseUntil) {
+        Some(until) => env.ledger().timestamp() < until,
+        None => true,
+    }
 }
 
 /// Set the paused flag to `true` and record the current ledger timestamp.
@@ -143,16 +267,100 @@ pub fn pause_with_reason(env: &Env, reason: Option<String>) {
     }
 }
 
+/// Pause the contract until the given ledger timestamp, then resume
+/// automatically (#804).
+///
+/// The flag, pause timestamp and optional expiry are stored under the same
+/// keys as [`pause`]; `is_paused` returns `false` once `now >= until` without
+/// requiring an explicit [`unpause`] call. Passing `until` at or before the
+/// current ledger timestamp is equivalent to not pausing at all.
+pub fn pause_until(env: &Env, until: u64) {
+    if env.ledger().timestamp() >= until {
+        return;
+    }
+    env.storage().instance().set(&DataKey::Paused, &true);
+    env.storage()
+        .instance()
+        .set(&DataKey::PausedSince, &env.ledger().timestamp());
+    env.storage().instance().set(&DataKey::PauseUntil, &until);
+}
+
+/// Returns the ledger timestamp at which an automatic pause expires.
+pub fn pause_until_at(env: &Env) -> Option<u64> {
+    env.storage().instance().get(&DataKey::PauseUntil)
+}
+
+/// Returns the configured pauser address, or `None` if no pauser role is set.
+pub fn get_pauser(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Pauser)
+}
+
+/// Assign `pauser` as the hot key allowed to pause the contract.
+///
+/// **Admin-only**: the consuming contract must authenticate the admin before
+/// calling this helper. This crate does not know the admin `Address`, so it
+/// cannot enforce that check itself.
+///
+/// Emits a [`PauserChanged`] event. Overwrites any previously configured
+/// pauser.
+pub fn set_pauser(env: &Env, pauser: &Address) {
+    env.storage().instance().set(&DataKey::Pauser, pauser);
+    env.events().publish(
+        (PAUSER_CHANGED,),
+        PauserChanged {
+            pauser: Some(pauser.clone()),
+        },
+    );
+}
+
+/// Remove the pauser role, leaving only the admin able to pause.
+///
+/// **Admin-only**: the consuming contract must authenticate the admin before
+/// calling this helper.
+///
+/// Emits a [`PauserChanged`] event with `pauser: None`.
+pub fn clear_pauser(env: &Env) {
+    env.storage().instance().remove(&DataKey::Pauser);
+    env.events()
+        .publish((PAUSER_CHANGED,), PauserChanged { pauser: None });
+}
+
+/// Pause the contract if `caller` is the admin or the configured pauser.
+///
+/// The consuming contract must authenticate `caller` (e.g. via
+/// `caller.require_auth()`) before calling this helper. Returns `true` when
+/// the caller was authorized and the pause was applied, `false` otherwise.
+///
+/// Unpausing is intentionally **not** covered by this helper — [`unpause`]
+/// remains admin-only so a hot pauser key can never resume the contract.
+pub fn pause_authorized(env: &Env, caller: &Address, admin: &Address) -> bool {
+    let is_admin = caller == admin;
+    let is_pauser = match get_pauser(env) {
+        Some(pauser) => &pauser == caller,
+        None => false,
+    };
+    if is_admin || is_pauser {
+        pause(env);
+        true
+    } else {
+        false
+    }
+}
+
 /// Clear the paused flag, returning the contract to the active state.
 ///
 /// Also clears the stored pause timestamp and reason so they do not linger
 /// after the contract resumes.
 ///
 /// Calling this when not paused is a no-op — the flag remains cleared.
+///
+/// **Admin-only**: the pauser role cannot unpause.
 pub fn unpause(env: &Env) {
     env.storage().instance().set(&DataKey::Paused, &false);
     env.storage().instance().remove(&DataKey::PausedSince);
     env.storage().instance().remove(&DataKey::PauseReason);
+    env.storage().instance().remove(&DataKey::PauseUntil);
+    env.storage().instance().remove(&DataKey::PausedScopes);
 }
 
 /// Returns the ledger timestamp (seconds since Unix epoch) at which the
@@ -170,6 +378,9 @@ pub fn unpause(env: &Env) {
 /// }
 /// ```
 pub fn paused_since(env: &Env) -> Option<u64> {
+    if !is_paused(env) {
+        return None;
+    }
     env.storage().instance().get(&DataKey::PausedSince)
 }
 
@@ -179,6 +390,9 @@ pub fn paused_since(env: &Env) -> Option<u64> {
 ///
 /// This value is cleared automatically when [`unpause`] is called.
 pub fn pause_reason(env: &Env) -> Option<String> {
+    if !is_paused(env) {
+        return None;
+    }
     env.storage().instance().get(&DataKey::PauseReason)
 }
 

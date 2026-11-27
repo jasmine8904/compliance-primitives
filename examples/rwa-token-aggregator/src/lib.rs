@@ -68,6 +68,7 @@ pub enum CheckKind {
     Denylist = 0,
     Jurisdiction = 1,
     CircuitBreaker = 2,
+    Allowlist = 3,
 }
 
 /// Mirror of `compliance_aggregator::CheckResult`.
@@ -86,11 +87,7 @@ pub struct CheckResult {
 /// Subset of the `compliance-aggregator` interface this token uses.
 #[contractclient(name = "AggregatorClient")]
 pub trait ComplianceAggregatorInterface {
-    fn check_address(
-        env: Env,
-        address: Address,
-        allowed_jurisdictions: Vec<String>,
-    ) -> (bool, Vec<CheckResult>);
+    fn check_address(env: Env, address: Address, allowed_jurisdictions: Vec<String>) -> (bool, Vec<CheckResult>);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +116,7 @@ pub enum Error {
     /// The aggregator call itself failed (misconfiguration or a downstream
     /// trap). Treated as a denial: the token fails closed.
     ComplianceUnavailable = 8,
+    NotAllowlisted = 9,
 }
 
 // ---------------------------------------------------------------------------
@@ -132,44 +130,28 @@ pub struct RwaAggregatorToken;
 impl RwaAggregatorToken {
     /// Wire this token to a deployed `compliance-aggregator` and the set of
     /// jurisdiction codes that may hold and transfer it.
-    pub fn initialize(
-        env: Env,
-        aggregator: Address,
-        allowed_codes: Vec<String>,
-    ) -> Result<(), Error> {
+    pub fn initialize(env: Env, aggregator: Address, allowed_codes: Vec<String>) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Aggregator) {
             return Err(Error::AlreadyInitialized);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Aggregator, &aggregator);
-        env.storage()
-            .instance()
-            .set(&DataKey::AllowedCodes, &allowed_codes);
+        env.storage().instance().set(&DataKey::Aggregator, &aggregator);
+        env.storage().instance().set(&DataKey::AllowedCodes, &allowed_codes);
         Ok(())
     }
 
     /// Returns the configured aggregator address.
     pub fn aggregator(env: Env) -> Result<Address, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Aggregator)
-            .ok_or(Error::NotInitialized)
+        env.storage().instance().get(&DataKey::Aggregator).ok_or(Error::NotInitialized)
     }
 
     /// Test/demo helper to fund an address with an initial balance.
     pub fn mint(env: Env, to: Address, amount: i128) {
         let balance = Self::balance(env.clone(), to.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to), &(balance + amount));
+        env.storage().persistent().set(&DataKey::Balance(to), &(balance + amount));
     }
 
     pub fn balance(env: Env, address: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Balance(address))
-            .unwrap_or(0)
+        env.storage().persistent().get(&DataKey::Balance(address)).unwrap_or(0)
     }
 
     /// Transfer `amount` from `from` to `to`.
@@ -182,16 +164,10 @@ impl RwaAggregatorToken {
             return Err(Error::InvalidAmount);
         }
 
-        let aggregator_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Aggregator)
-            .ok_or(Error::NotInitialized)?;
-        let allowed_codes: Vec<String> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllowedCodes)
-            .ok_or(Error::NotInitialized)?;
+        let aggregator_addr: Address =
+            env.storage().instance().get(&DataKey::Aggregator).ok_or(Error::NotInitialized)?;
+        let allowed_codes: Vec<String> =
+            env.storage().instance().get(&DataKey::AllowedCodes).ok_or(Error::NotInitialized)?;
 
         let aggregator = AggregatorClient::new(&env, &aggregator_addr);
         Self::require_compliant(&env, &aggregator, &from, &allowed_codes)?;
@@ -203,12 +179,8 @@ impl RwaAggregatorToken {
         }
         let to_balance = Self::balance(env.clone(), to.clone());
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from), &(from_balance - amount));
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to), &(to_balance + amount));
+        env.storage().persistent().set(&DataKey::Balance(from), &(from_balance - amount));
+        env.storage().persistent().set(&DataKey::Balance(to), &(to_balance + amount));
         Ok(())
     }
 
@@ -240,6 +212,7 @@ impl RwaAggregatorToken {
                     CheckKind::CircuitBreaker => Error::CircuitBreakerFrozen,
                     CheckKind::Denylist => Error::DeniedByGate,
                     CheckKind::Jurisdiction => Error::JurisdictionNotPermitted,
+                    CheckKind::Allowlist => Error::NotAllowlisted,
                 });
             }
         }

@@ -24,13 +24,19 @@ fn setup_jurisdiction(env: &Env) -> Address {
     env.register(MockJurisdiction, ())
 }
 
-/// Registers and initialises a policy-engine contract with `All` semantics,
-/// returns `(admin, contract_id, client)`.
+/// The default policy name used by the single-policy helpers below.
+fn default_policy(env: &Env) -> String {
+    String::from_str(env, "default")
+}
+
+/// Registers and initialises a policy-engine contract with a single named
+/// policy using `All` semantics, returns `(admin, contract_id, client)`.
 fn setup_engine_all(env: &Env) -> (Address, Address, PolicyEngineClient<'_>) {
     let admin = Address::generate(env);
     let id = env.register(PolicyEngine, ());
     let client = PolicyEngineClient::new(env, &id);
-    client.initialize(&admin, &CombineOp::All, &None);
+    client.initialize(&admin);
+    client.create_policy(&admin, &default_policy(env), &CombineOp::All, &None);
     (admin, id, client)
 }
 
@@ -39,7 +45,8 @@ fn setup_engine_any(env: &Env) -> (Address, Address, PolicyEngineClient<'_>) {
     let admin = Address::generate(env);
     let id = env.register(PolicyEngine, ());
     let client = PolicyEngineClient::new(env, &id);
-    client.initialize(&admin, &CombineOp::Any, &None);
+    client.initialize(&admin);
+    client.create_policy(&admin, &default_policy(env), &CombineOp::Any, &None);
     (admin, id, client)
 }
 
@@ -81,7 +88,7 @@ fn test_all_checks_pass() {
         }),
     );
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&default_policy(&env), &from, &to);
     assert!(result);
 }
 
@@ -122,7 +129,7 @@ fn test_one_check_fails_and_semantics() {
         }),
     );
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&default_policy(&env), &from, &to);
     assert!(!result);
 }
 
@@ -166,7 +173,7 @@ fn test_one_check_passes_or_semantics() {
     );
 
     // With Any: the jurisdiction check passes for both → result is true.
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&default_policy(&env), &from, &to);
     assert!(result);
 }
 
@@ -180,32 +187,36 @@ fn test_add_and_remove_check() {
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
 
+    let name = default_policy(&env);
+
     // Initially empty.
-    assert_eq!(client.get_checks().len(), 0);
+    assert_eq!(client.get_checks(&name).len(), 0);
 
     // Add one check.
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
-    assert_eq!(client.get_checks().len(), 1);
+    assert_eq!(client.get_checks(&name).len(), 1);
 
     // Add a second check.
     let juri_id = setup_jurisdiction(&env);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
-    assert_eq!(client.get_checks().len(), 2);
+    assert_eq!(client.get_checks(&name).len(), 2);
 
     // Remove the first check (index 0); list should shrink to 1.
-    client.remove_check(&admin, &0);
-    assert_eq!(client.get_checks().len(), 1);
+    client.remove_check(&admin, &name, &0);
+    assert_eq!(client.get_checks(&name).len(), 1);
 }
 
 #[test]
@@ -214,7 +225,8 @@ fn test_remove_check_out_of_bounds_returns_contract_error() {
     env.mock_all_auths();
     let (admin, _engine_id, client) = setup_engine_all(&env);
 
-    let result = client.try_remove_check(&admin, &0u32);
+    let name = default_policy(&env);
+    let result = client.try_remove_check(&admin, &name, &0u32);
     assert_eq!(result, Err(Ok(Error::IndexOutOfBounds)));
 }
 
@@ -227,23 +239,26 @@ fn test_clear_checks_resets_policy_to_empty() {
     let juri_id = setup_jurisdiction(&env);
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
 
-    assert_eq!(client.get_checks().len(), 2);
-    client.clear_checks(&admin);
-    assert_eq!(client.get_checks().len(), 0);
+    assert_eq!(client.get_checks(&name).len(), 2);
+    client.clear_checks(&admin, &name);
+    assert_eq!(client.get_checks(&name).len(), 0);
 }
 
 /// `swap_checks` exchanges the positions of two checks so that `evaluate`
@@ -268,10 +283,12 @@ fn test_swap_checks_reorders_and_short_circuits() {
     MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     // Add jurisdiction check first (index 0), then denylist check (index 1).
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
@@ -279,17 +296,18 @@ fn test_swap_checks_reorders_and_short_circuits() {
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
 
     // Before swap: jurisdiction (passes) then denylist (fails) → false.
-    assert!(!client.evaluate(&from, &to));
+    assert!(!client.evaluate_policy(&name, &from, &to));
 
     // Swap positions 0 and 1: denylist is now index 0, jurisdiction is index 1.
-    client.swap_checks(&admin, &0, &1);
-    let checks = client.get_checks();
+    client.swap_checks(&admin, &name, &0, &1);
+    let checks = client.get_checks(&name);
     assert_eq!(checks.len(), 2);
     // The first check must now be the denylist check.
     match checks.get(0).unwrap() {
@@ -303,7 +321,7 @@ fn test_swap_checks_reorders_and_short_circuits() {
 
     // After swap the denylist short-circuits first — result is still false,
     // but the cheaper check now fires before the jurisdiction check.
-    assert!(!client.evaluate(&from, &to));
+    assert!(!client.evaluate_policy(&name, &from, &to));
 }
 
 /// `swap_checks` with equal indices is a no-op — the list is unchanged.
@@ -314,18 +332,20 @@ fn test_swap_checks_same_index_is_noop() {
 
     let deny_id = setup_denylist(&env);
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
-    assert_eq!(client.get_checks().len(), 1);
+    assert_eq!(client.get_checks(&name).len(), 1);
 
     // Swapping index 0 with itself must not panic and must leave the list intact.
-    client.swap_checks(&admin, &0, &0);
-    assert_eq!(client.get_checks().len(), 1);
+    client.swap_checks(&admin, &name, &0, &0);
+    assert_eq!(client.get_checks(&name).len(), 1);
 }
 
 /// `swap_checks` with an out-of-range index panics (the generated client
@@ -338,16 +358,18 @@ fn test_swap_checks_out_of_bounds() {
 
     let deny_id = setup_denylist(&env);
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
 
     // Only one check at index 0; index 1 is out of range.
-    client.swap_checks(&admin, &0, &1);
+    client.swap_checks(&admin, &name, &0, &1);
 }
 
 /// `get_policy` returns a `PolicyNode` whose `op` and `checks` fields exactly
@@ -365,17 +387,20 @@ fn test_get_policy_matches_configuration() {
 
     // Initialise with `Any` semantics and add two checks.
     let (admin, _engine_id, client) = setup_engine_any(&env);
+    let name = default_policy(&env);
 
     let allowed_codes = vec![&env, String::from_str(&env, "US"), String::from_str(&env, "GB")];
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: allowed_codes.clone(),
@@ -383,7 +408,7 @@ fn test_get_policy_matches_configuration() {
     );
 
     // Fetch the full policy tree.
-    let policy = client.get_policy();
+    let policy = client.get_policy(&name);
 
     // The combine operator must match what was passed to `initialize`.
     assert_eq!(policy.op, CombineOp::Any);
@@ -437,8 +462,10 @@ fn test_write_extends_instance_ttl_past_original_expiry() {
     assert!(instance_ttl(&env, &contract_id) < INSTANCE_TTL_THRESHOLD);
 
     // A write refreshes the TTL back to the target.
+    let name = default_policy(&env);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
@@ -451,8 +478,8 @@ fn test_write_extends_instance_ttl_past_original_expiry() {
     });
 
     // State written before and after the refresh is still readable.
-    assert_eq!(client.get_checks().len(), 1);
-    assert!(client.get_op() == CombineOp::All);
+    assert_eq!(client.get_checks(&name).len(), 1);
+    assert!(client.get_op(&name) == CombineOp::All);
 
     // Remaining write paths also refresh the TTL. Remaining TTL is currently
     // EXTEND_TO - THRESHOLD - 1; drop it just below the threshold.
@@ -460,7 +487,7 @@ fn test_write_extends_instance_ttl_past_original_expiry() {
         li.sequence_number += INSTANCE_TTL_EXTEND_TO - 2 * INSTANCE_TTL_THRESHOLD;
     });
     assert!(instance_ttl(&env, &contract_id) < INSTANCE_TTL_THRESHOLD);
-    client.remove_check(&admin, &0);
+    client.remove_check(&admin, &name, &0);
     assert_eq!(instance_ttl(&env, &contract_id), INSTANCE_TTL_EXTEND_TO);
 
     env.ledger().with_mut(|li| {
@@ -502,15 +529,18 @@ fn test_all_three_check_kinds_all_pass() {
     // MockCircuitBreaker starts unfrozen by default.
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
@@ -518,12 +548,13 @@ fn test_all_three_check_kinds_all_pass() {
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::CircuitBreaker(CircuitBreakerCheck {
             contract: cb_id.clone(),
         }),
     );
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(result, "expected all-pass with three check kinds (All)");
 }
 
@@ -550,15 +581,18 @@ fn test_circuit_breaker_check_kind_frozen_fails_all() {
     MockCircuitBreakerClient::new(&env, &cb_id).freeze();
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
@@ -566,12 +600,13 @@ fn test_circuit_breaker_check_kind_frozen_fails_all() {
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::CircuitBreaker(CircuitBreakerCheck {
             contract: cb_id.clone(),
         }),
     );
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(!result, "expected false when circuit-breaker is frozen (All)");
 }
 
@@ -597,15 +632,18 @@ fn test_circuit_breaker_check_kind_passes_any_semantics() {
     // Circuit-breaker is not frozen (circuit-breaker check passes).
 
     let (admin, _engine_id, client) = setup_engine_any(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
@@ -613,13 +651,14 @@ fn test_circuit_breaker_check_kind_passes_any_semantics() {
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::CircuitBreaker(CircuitBreakerCheck {
             contract: cb_id.clone(),
         }),
     );
 
     // With Any: circuit-breaker passes for both → result is true.
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(result, "expected true: circuit-breaker passes under Any semantics");
 }
 
@@ -645,15 +684,18 @@ fn test_all_three_check_kinds_all_fail_any() {
     MockCircuitBreakerClient::new(&env, &cb_id).freeze();
 
     let (admin, _engine_id, client) = setup_engine_any(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
@@ -661,12 +703,13 @@ fn test_all_three_check_kinds_all_fail_any() {
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::CircuitBreaker(CircuitBreakerCheck {
             contract: cb_id.clone(),
         }),
     );
 
-    let result = client.evaluate(&from, &to);
+    let result = client.evaluate_policy(&name, &from, &to);
     assert!(!result, "expected false when all three checks fail under Any");
 }
 
@@ -701,6 +744,19 @@ fn test_get_admin_not_initialized_returns_error() {
         result.is_err(),
         "get_admin should return an error before initialization"
     );
+}
+
+/// `is_paused` reflects the shared pausable state.
+#[test]
+fn test_is_paused_returns_current_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, engine_id, client) = setup_engine_all(&env);
+
+    assert!(!client.is_paused());
+
+    env.as_contract(&engine_id, || compliance_pausable::pause(&env));
+    assert!(client.is_paused());
 }
 
 // ---------------------------------------------------------------------------
@@ -855,22 +911,25 @@ fn test_evaluate_verbose_passes_returns_none_failure() {
     MockJurisdictionClient::new(&env, &juri_id).set_jurisdiction(&to, &code_us);
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
 
-    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    let (passed, failure) = client.evaluate_verbose(&name, &from, &to);
     assert!(passed, "expected policy to pass");
     assert!(failure.is_none(), "expected no CheckFailure when policy passes");
 }
@@ -895,23 +954,26 @@ fn test_evaluate_verbose_fails_surfaces_check_failure() {
     MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
 
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     // Register Denylist at index 0, Jurisdiction at index 1.
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
 
-    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    let (passed, failure) = client.evaluate_verbose(&name, &from, &to);
     assert!(!passed, "expected policy to fail");
 
     let f = failure.expect("expected Some(CheckFailure) when policy fails");
@@ -939,23 +1001,26 @@ fn test_evaluate_verbose_all_failure_blames_failing_check() {
     // Denylist check passes: neither address is denied.
     // Jurisdiction check fails: no codes set for either address.
     let (admin, _engine_id, client) = setup_engine_all(&env);
+    let name = default_policy(&env);
 
     // Register Denylist at index 0, Jurisdiction at index 1.
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
 
-    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    let (passed, failure) = client.evaluate_verbose(&name, &from, &to);
     assert!(!passed, "expected policy to fail");
 
     let f = failure.expect("expected Some(CheckFailure) when policy fails");
@@ -981,21 +1046,24 @@ fn test_evaluate_verbose_any_failure_does_not_blame_first_check() {
     MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
 
     let (admin, _engine_id, client) = setup_engine_any(&env);
+    let name = default_policy(&env);
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id,
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id,
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
 
-    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    let (passed, failure) = client.evaluate_verbose(&name, &from, &to);
     assert!(!passed, "expected policy to fail");
 
     let failure = failure.expect("expected failure details for failed Any policy");
@@ -1022,22 +1090,25 @@ fn test_evaluate_verbose_any_all_checks_fail_reports_all_failed() {
     // Jurisdiction check fails: no codes set for either address.
 
     let (admin, _engine_id, client) = setup_engine_any(&env);
+    let name = default_policy(&env);
 
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Denylist(DenylistCheck {
             contract: deny_id.clone(),
         }),
     );
     client.add_check(
         &admin,
+        &name,
         &CheckKind::Jurisdiction(JurisdictionCheck {
             contract: juri_id.clone(),
             allowed_codes: vec![&env, String::from_str(&env, "US")],
         }),
     );
 
-    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    let (passed, failure) = client.evaluate_verbose(&name, &from, &to);
     assert!(!passed, "expected policy to fail");
 
     let f = failure.expect("expected Some(CheckFailure) when policy fails");

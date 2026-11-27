@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this file to scripts/deploy-config.json and fill in your values. Never commit deploy-config.json (it is git-ignored).",
+  "network": "testnet",
+  "source": "default",
+  "rpc_url": "",
+  "network_passphrase": ""
+}

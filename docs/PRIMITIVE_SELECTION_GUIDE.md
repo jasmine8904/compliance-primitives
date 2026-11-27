@@ -265,7 +265,7 @@ A: Yes. The primitives are meant to be building blocks. You can add your own che
 A: For allowlist-only → denylist+allowlist, you can add denylist checks to your existing token contract. For more complex changes, policy-engine avoids redeployment. Otherwise, you'll need to migrate (see [MIGRATION.md](./MIGRATION.md)).
 
 **Q: Can I use allowlist-token with policy-engine?**
-A: Not directly — allowlist-token is a wrapper token contract, not a primitive gate. Policy-engine works with denylist-gate and jurisdiction-flag. If you want allowlist + policy-engine composition, either use allowlist-token standalone or implement allowlist logic inside policy-engine (outside the scope of these primitives).
+A: Yes. `allowlist-token` exposes `is_allowed(address)`, which `policy-engine` can use as an `Allowlist` check. For a fixed AND of denylist, jurisdiction, and allowlist checks, configure `compliance-aggregator` with `set_allowlist`.
 
 **Q: How do I stay in sync with sanctions lists?**
 A: Set up an off-chain monitoring system that polls your denylist contract and compares it against authoritative sources (e.g., OFAC SDN list). Update your denylist regularly (weekly recommended). See SECURITY.md for considerations.

@@ -28,6 +28,7 @@
 //! Longer local run: increase `DEFAULT_ITERATIONS` in this file (not wired into CI).
 
 use super::*;
+use proptest::prelude::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, Env, Vec};
 
@@ -40,6 +41,46 @@ enum Op {
     Add,
     Remove,
     Check,
+}
+
+/// Extended operation set used by the proptest suites. Covers the full state
+/// machine: denylist mutations, pause/unpause, and admin rotation.
+#[derive(Clone, Copy, Debug)]
+enum PropOp {
+    Add,
+    Remove,
+    Check,
+    Pause,
+    Unpause,
+    ChangeAdmin,
+}
+
+impl PropOp {
+    fn from_u8(v: u8) -> Self {
+        match v % 6 {
+            0 => PropOp::Add,
+            1 => PropOp::Remove,
+            2 => PropOp::Check,
+            3 => PropOp::Pause,
+            4 => PropOp::Unpause,
+            _ => PropOp::ChangeAdmin,
+        }
+    }
+}
+
+/// Deterministic proptest configuration: fixed seed, fixed case count.
+fn fixed_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: 128,
+        rng_seed: ProptestRngSeed::Fixed(0xDEAD_BEEF),
+        ..ProptestConfig::default()
+    }
+}
+
+/// Strategy producing a random sequence of `PropOp`s paired with an address
+/// index in `0..MAX_ADDRESSES`.
+fn op_sequence() -> impl Strategy<Value = std::vec::Vec<(u8, usize)>> {
+    prop::collection::vec((any::<u8>(), 0usize..MAX_ADDRESSES), 1..=MAX_SEQUENCE_LEN)
 }
 
 struct Rng(u64);
@@ -123,5 +164,213 @@ fn run_sequence(seed: u64) {
 fn fuzz_denylist_sequences() {
     for seed in 0..DEFAULT_ITERATIONS {
         run_sequence(seed as u64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// proptest suites
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(fixed_config())]
+
+    /// Invariant: after any sequence of add/remove/check, `check(addr)` is
+    /// `true` iff the address is not in the denylist, and the tracked set of
+    /// denied addresses matches the contract state exactly (count consistency).
+    #[test]
+    fn prop_denylist_membership_matches_set(ops in op_sequence()) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(DenylistGate, ());
+        let client = DenylistGateClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let mut addresses = Vec::new(&env);
+        for _ in 0..MAX_ADDRESSES {
+            addresses.push_back(Address::generate(&env));
+        }
+        let mut denied = [false; MAX_ADDRESSES];
+
+        for (raw, idx) in ops {
+            let address = addresses.get(idx as u32).unwrap();
+            match PropOp::from_u8(raw) {
+                PropOp::Add => {
+                    client.add_to_denylist(&admin, &address);
+                    denied[idx] = true;
+                }
+                PropOp::Remove => {
+                    client.remove_from_denylist(&admin, &address);
+                    denied[idx] = false;
+                }
+                PropOp::Check => {
+                    prop_assert_eq!(client.check(&address), !denied[idx]);
+                }
+                // Pause/unpause/admin changes do not affect membership.
+                PropOp::Pause | PropOp::Unpause | PropOp::ChangeAdmin => {}
+            }
+        }
+
+        // Count consistency: exactly the tracked addresses are denied.
+        let mut denied_count = 0usize;
+        for idx in 0..MAX_ADDRESSES {
+            let address = addresses.get(idx as u32).unwrap();
+            let clear = client.check(&address);
+            prop_assert_eq!(clear, !denied[idx]);
+            if !clear {
+                denied_count += 1;
+            }
+        }
+        let expected_count = denied.iter().filter(|d| **d).count();
+        prop_assert_eq!(denied_count, expected_count);
+    }
+
+    /// Invariant: while paused, every write (add/remove) is rejected and the
+    /// denylist state is unchanged. Unpausing restores write access.
+    #[test]
+    fn prop_pause_blocks_writes(ops in op_sequence()) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(DenylistGate, ());
+        let client = DenylistGateClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let mut addresses = Vec::new(&env);
+        for _ in 0..MAX_ADDRESSES {
+            addresses.push_back(Address::generate(&env));
+        }
+        let mut denied = [false; MAX_ADDRESSES];
+        let mut paused = false;
+
+        for (raw, idx) in ops {
+            let address = addresses.get(idx as u32).unwrap();
+            match PropOp::from_u8(raw) {
+                PropOp::Add => {
+                    if paused {
+                        // Writes must be rejected while paused.
+                        let res = client.try_add_to_denylist(&admin, &address);
+                        prop_assert!(res.is_err());
+                    } else {
+                        client.add_to_denylist(&admin, &address);
+                        denied[idx] = true;
+                    }
+                }
+                PropOp::Remove => {
+                    if paused {
+                        let res = client.try_remove_from_denylist(&admin, &address);
+                        prop_assert!(res.is_err());
+                    } else {
+                        client.remove_from_denylist(&admin, &address);
+                        denied[idx] = false;
+                    }
+                }
+                PropOp::Check => {
+                    prop_assert_eq!(client.check(&address), !denied[idx]);
+                }
+                PropOp::Pause => {
+                    client.pause(&admin);
+                    paused = true;
+                }
+                PropOp::Unpause => {
+                    client.unpause(&admin);
+                    paused = false;
+                }
+                PropOp::ChangeAdmin => {}
+            }
+        }
+    }
+
+    /// Invariant: add/remove are idempotent — repeating the same mutation does
+    /// not change observable state.
+    #[test]
+    fn prop_add_remove_idempotent(ops in op_sequence()) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(DenylistGate, ());
+        let client = DenylistGateClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let mut addresses = Vec::new(&env);
+        for _ in 0..MAX_ADDRESSES {
+            addresses.push_back(Address::generate(&env));
+        }
+
+        for (raw, idx) in ops {
+            let address = addresses.get(idx as u32).unwrap();
+            match PropOp::from_u8(raw) {
+                PropOp::Add => {
+                    client.add_to_denylist(&admin, &address);
+                    let after_first = client.check(&address);
+                    client.add_to_denylist(&admin, &address);
+                    prop_assert_eq!(client.check(&address), after_first);
+                    prop_assert!(!after_first);
+                }
+                PropOp::Remove => {
+                    client.remove_from_denylist(&admin, &address);
+                    let after_first = client.check(&address);
+                    client.remove_from_denylist(&admin, &address);
+                    prop_assert_eq!(client.check(&address), after_first);
+                    prop_assert!(after_first);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Invariant: admin-only paths (add/remove/pause/unpause/change_admin)
+    /// reject callers that are not the current admin.
+    #[test]
+    fn prop_admin_only_paths(ops in op_sequence()) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(DenylistGate, ());
+        let client = DenylistGateClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let mut addresses = Vec::new(&env);
+        for _ in 0..MAX_ADDRESSES {
+            addresses.push_back(Address::generate(&env));
+        }
+        let mut current_admin = admin.clone();
+
+        for (raw, idx) in ops {
+            let address = addresses.get(idx as u32).unwrap();
+            let outsider = Address::generate(&env);
+            match PropOp::from_u8(raw) {
+                PropOp::Add => {
+                    prop_assert!(client
+                        .try_add_to_denylist(&outsider, &address)
+                        .is_err());
+                }
+                PropOp::Remove => {
+                    prop_assert!(client
+                        .try_remove_from_denylist(&outsider, &address)
+                        .is_err());
+                }
+                PropOp::Pause => {
+                    prop_assert!(client.try_pause(&outsider).is_err());
+                }
+                PropOp::Unpause => {
+                    prop_assert!(client.try_unpause(&outsider).is_err());
+                }
+                PropOp::ChangeAdmin => {
+                    let new_admin = Address::generate(&env);
+                    prop_assert!(client
+                        .try_change_admin(&outsider, &new_admin)
+                        .is_err());
+                    // The legitimate admin can rotate.
+                    client.change_admin(&current_admin, &new_admin);
+                    current_admin = new_admin;
+                }
+                PropOp::Check => {}
+            }
+        }
     }
 }

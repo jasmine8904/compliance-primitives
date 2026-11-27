@@ -160,11 +160,76 @@ stellar contract invoke \
 # above but not wired into policy-engine or compliance-aggregator, both of
 # which only compose the other two primitives today.
 
+# ---------------------------------------------------------------------------
+# Step 3: record deployed IDs for the current release and refresh README
+# ---------------------------------------------------------------------------
+
+# Release key for the IDs table. Defaults to the workspace version from
+# Cargo.toml (e.g. "0.1.0"); override with RELEASE=<label> if desired.
+if [ -z "${RELEASE:-}" ]; then
+  RELEASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+fi
+if [ -z "$RELEASE" ]; then
+  echo "error: could not determine release version; set RELEASE=<label>" >&2
+  exit 1
+fi
+
+IDS_FILE="$REPO_ROOT/testnet-ids.json"
+echo "==> Recording deployed contract IDs for release ${RELEASE} in testnet-ids.json..."
+
+RELEASE="$RELEASE" NETWORK="$NETWORK" IDS_FILE="$IDS_FILE" \
+ALLOWLIST_ID="$ALLOWLIST_ID" GATE_ID="$GATE_ID" \
+JURISDICTION_ID="$JURISDICTION_ID" AUDIT_LOG_ID="$AUDIT_LOG_ID" \
+CIRCUIT_BREAKER_ID="$CIRCUIT_BREAKER_ID" MULTISIG_ID="$MULTISIG_ID" \
+AGGREGATOR_ID="$AGGREGATOR_ID" POLICY_ENGINE_ID="$POLICY_ENGINE_ID" \
+node --input-type=module -e '
+import { readFileSync, writeFileSync } from "node:fs";
+
+const file = process.env.IDS_FILE;
+const release = process.env.RELEASE;
+
+let data = { releases: [] };
+try {
+  data = JSON.parse(readFileSync(file, "utf8"));
+} catch (err) {
+  if (err.code !== "ENOENT") throw err;
+}
+if (!Array.isArray(data.releases)) data.releases = [];
+
+const entry = {
+  release,
+  network: process.env.NETWORK,
+  contracts: {
+    "allowlist-token": process.env.ALLOWLIST_ID,
+    "denylist-gate": process.env.GATE_ID,
+    "jurisdiction-flag": process.env.JURISDICTION_ID,
+    "audit-log": process.env.AUDIT_LOG_ID,
+    "circuit-breaker": process.env.CIRCUIT_BREAKER_ID,
+    "multisig-admin": process.env.MULTISIG_ID,
+    "compliance-aggregator": process.env.AGGREGATOR_ID,
+    "policy-engine": process.env.POLICY_ENGINE_ID,
+  },
+};
+
+const idx = data.releases.findIndex((r) => r.release === release);
+if (idx >= 0) {
+  data.releases[idx] = entry;
+} else {
+  data.releases.push(entry);
+}
+
+writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+'
+
+echo "==> Regenerating README testnet IDs table..."
+node "$REPO_ROOT/scripts/update-testnet-ids.mjs"
+
 cat <<EOF
 
 ============================================================
 Full-stack testnet deployment ($NETWORK)
 ============================================================
+Release:                $RELEASE
 Issuer / admin:        $ISSUER
 allowlist-token:       $ALLOWLIST_ID
 denylist-gate:         $GATE_ID

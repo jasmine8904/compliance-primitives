@@ -10,17 +10,30 @@ can inspect and invoke without building from scratch.
 
 ## Current reference addresses
 
+The canonical, always-current list of deployed testnet contract IDs lives in
+two generated places:
+
+- [`testnet-ids.json`](./testnet-ids.json) — machine-readable, keyed by
+  release, consumed by tooling and CI.
+- The **Testnet contract IDs** table in [`README.md`](./README.md) — the
+  human-readable per-release table.
+
+Both are written automatically by `scripts/deploy-rwa-testnet.sh`; do not
+hand-edit them. The table below is a convenience snapshot and may lag behind
+the generated sources.
+
 | Contract | Testnet contract ID |
 | --- | --- |
-| Issuer / admin (deployer) | _fill after deploy_ |
-| `allowlist-token` | _fill after deploy_ |
-| `denylist-gate` | _fill after deploy_ |
-| `jurisdiction-flag` | _fill after deploy_ |
-| `rwa-token` | _fill after deploy_ |
+| Issuer / admin (deployer) | _see generated table in README.md_ |
+| `allowlist-token` | _see generated table in README.md_ |
+| `denylist-gate` | _see generated table in README.md_ |
+| `jurisdiction-flag` | _see generated table in README.md_ |
+| `rwa-token` | _see generated table in README.md_ |
 | `allowed_codes` | `["US","CA"]` |
 
 Testnet resets wipe contract state. After a reset (or when these IDs go
-stale), re-run the deploy script below and replace the table.
+stale), re-run the deploy script below; it refreshes `testnet-ids.json` and
+the README table for you.
 
 ## One-shot redeploy
 
@@ -30,9 +43,8 @@ stellar keys generate rwa-ref --network testnet --fund
 # or: stellar keys fund rwa-ref --network testnet
 
 # 2. Build + deploy + initialize all four contracts
+#    (also updates testnet-ids.json and the README table automatically)
 STELLAR_SOURCE=rwa-ref ./scripts/deploy-rwa-testnet.sh
-
-# 3. Paste the printed IDs into the table above
 ```
 
 Optional: `ALLOWED_CODES='["US","GB"]' STELLAR_SOURCE=rwa-ref ./scripts/deploy-rwa-testnet.sh`
@@ -132,5 +144,5 @@ stellar contract invoke --id "$JURISDICTION" --source "$SOURCE" --network "$NETW
 ## Keeping this doc fresh
 
 1. After every testnet reset (or when invokes start failing with missing contract), run `STELLAR_SOURCE=… ./scripts/deploy-rwa-testnet.sh`.
-2. Replace the address table with the script output.
-3. Commit the updated `TESTNET.md` so the reference stays accurate.
+2. The script rewrites `testnet-ids.json` and the README **Testnet contract IDs** table; review the diff.
+3. Commit the updated `testnet-ids.json` and `README.md` so the reference stays accurate.

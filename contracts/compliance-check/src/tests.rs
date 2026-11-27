@@ -145,6 +145,51 @@ fn assert_not_compliant_jurisdiction(client: &JurisdictionFlagClient, address: &
 }
 
 // ---------------------------------------------------------------------------
+// Amount-aware generic helpers — exercise `is_compliant_with_amount`
+// ---------------------------------------------------------------------------
+
+/// Assert that `is_compliant_with_amount` on the allowlist client returns the
+/// expected value for the given optional amount.
+fn assert_compliant_with_amount_allowlist(
+    client: &AllowlistTokenClient,
+    address: &Address,
+    amount: Option<i128>,
+    expected: bool,
+) {
+    assert_eq!(
+        client.is_compliant_with_amount(address, &amount),
+        expected,
+        "unexpected is_compliant_with_amount result for allowlist-token"
+    );
+}
+
+fn assert_compliant_with_amount_denylist(
+    client: &DenylistGateClient,
+    address: &Address,
+    amount: Option<i128>,
+    expected: bool,
+) {
+    assert_eq!(
+        client.is_compliant_with_amount(address, &amount),
+        expected,
+        "unexpected is_compliant_with_amount result for denylist-gate"
+    );
+}
+
+fn assert_compliant_with_amount_jurisdiction(
+    client: &JurisdictionFlagClient,
+    address: &Address,
+    amount: Option<i128>,
+    expected: bool,
+) {
+    assert_eq!(
+        client.is_compliant_with_amount(address, &amount),
+        expected,
+        "unexpected is_compliant_with_amount result for jurisdiction-flag"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Setup helpers
 // ---------------------------------------------------------------------------
 
@@ -365,4 +410,133 @@ fn test_caller_rejects_mismatched_interface_version() {
     assert!(is_compatible(INTERFACE_VERSION));
     assert!(!is_compatible(INTERFACE_VERSION.wrapping_add(1)));
     assert!(!is_compatible(INTERFACE_VERSION.wrapping_sub(1)));
+}
+
+// ---------------------------------------------------------------------------
+// Amount-aware entry point: default delegation to `is_compliant`
+// ---------------------------------------------------------------------------
+
+/// The default `is_compliant_with_amount` implementation must delegate to
+/// `is_compliant`, ignoring the amount, for allowlist-token.
+#[test]
+fn test_allowlist_token_is_compliant_with_amount_delegates_to_is_compliant() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = Address::generate(&env);
+    s.allowlist.add_to_allowlist(&s.allowlist_admin, &alice, &None);
+
+    // allowlisted: compliant regardless of amount
+    assert_compliant_with_amount_allowlist(&s.allowlist, &alice, None, true);
+    assert_compliant_with_amount_allowlist(&s.allowlist, &alice, Some(0), true);
+    assert_compliant_with_amount_allowlist(&s.allowlist, &alice, Some(1_000), true);
+
+    let bob = Address::generate(&env);
+    // not allowlisted: non-compliant regardless of amount
+    assert_compliant_with_amount_allowlist(&s.allowlist, &bob, None, false);
+    assert_compliant_with_amount_allowlist(&s.allowlist, &bob, Some(0), false);
+    assert_compliant_with_amount_allowlist(&s.allowlist, &bob, Some(1_000), false);
+}
+
+/// The default `is_compliant_with_amount` implementation must delegate to
+/// `is_compliant`, ignoring the amount, for denylist-gate.
+#[test]
+fn test_denylist_gate_is_compliant_with_amount_delegates_to_is_compliant() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = Address::generate(&env);
+    // not denied: compliant regardless of amount
+    assert_compliant_with_amount_denylist(&s.denylist, &alice, None, true);
+    assert_compliant_with_amount_denylist(&s.denylist, &alice, Some(0), true);
+    assert_compliant_with_amount_denylist(&s.denylist, &alice, Some(1_000), true);
+
+    let charlie = Address::generate(&env);
+    s.denylist.add_to_denylist(&s.denylist_admin, &charlie);
+    // denied: non-compliant regardless of amount
+    assert_compliant_with_amount_denylist(&s.denylist, &charlie, None, false);
+    assert_compliant_with_amount_denylist(&s.denylist, &charlie, Some(0), false);
+    assert_compliant_with_amount_denylist(&s.denylist, &charlie, Some(1_000), false);
+}
+
+/// The default `is_compliant_with_amount` implementation must delegate to
+/// `is_compliant`, ignoring the amount, for jurisdiction-flag.
+#[test]
+fn test_jurisdiction_flag_is_compliant_with_amount_delegates_to_is_compliant() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = Address::generate(&env);
+    let us_code = String::from_str(&env, "US");
+    s.jurisdiction.set_jurisdiction(&s.issuer, &alice, &us_code);
+
+    // permitted jurisdiction: compliant regardless of amount
+    assert_compliant_with_amount_jurisdiction(&s.jurisdiction, &alice, None, true);
+    assert_compliant_with_amount_jurisdiction(&s.jurisdiction, &alice, Some(0), true);
+    assert_compliant_with_amount_jurisdiction(&s.jurisdiction, &alice, Some(1_000), true);
+
+    let bob = Address::generate(&env);
+    // no jurisdiction: non-compliant regardless of amount
+    assert_compliant_with_amount_jurisdiction(&s.jurisdiction, &bob, None, false);
+    assert_compliant_with_amount_jurisdiction(&s.jurisdiction, &bob, Some(0), false);
+    assert_compliant_with_amount_jurisdiction(&s.jurisdiction, &bob, Some(1_000), false);
+}
+
+// ---------------------------------------------------------------------------
+// Amount-aware override: a custom implementor enforcing a threshold
+// ---------------------------------------------------------------------------
+
+/// A minimal test implementor of `ComplianceCheck` that overrides
+/// `is_compliant_with_amount` to enforce a travel-rule style threshold.
+///
+/// Addresses are considered compliant when they are flagged as allowed and
+/// either no amount is supplied or the amount is at or below the threshold.
+struct ThresholdCheck {
+    threshold: i128,
+}
+
+impl ThresholdCheck {
+    fn new(threshold: i128) -> Self {
+        Self { threshold }
+    }
+
+    fn is_compliant(&self, allowed: bool) -> bool {
+        allowed
+    }
+
+    fn is_compliant_with_amount(&self, allowed: bool, amount: Option<i128>) -> bool {
+        if !self.is_compliant(allowed) {
+            return false;
+        }
+        match amount {
+            None => true,
+            Some(value) => value <= self.threshold,
+        }
+    }
+}
+
+/// A custom implementor can override `is_compliant_with_amount` to enforce an
+/// amount threshold while keeping the address-only check unchanged.
+#[test]
+fn test_custom_implementor_overrides_is_compliant_with_amount() {
+    let check = ThresholdCheck::new(1_000);
+
+    // Address-only check is unaffected by the threshold.
+    assert!(check.is_compliant(true));
+    assert!(!check.is_compliant(false));
+
+    // No amount supplied: fall back to the address-only result.
+    assert!(check.is_compliant_with_amount(true, None));
+    assert!(!check.is_compliant_with_amount(false, None));
+
+    // Amount at or below the threshold passes.
+    assert!(check.is_compliant_with_amount(true, Some(0)));
+    assert!(check.is_compliant_with_amount(true, Some(1_000)));
+
+    // Amount above the threshold fails.
+    assert!(!check.is_compliant_with_amount(true, Some(1_001)));
+
+    // A disallowed address fails regardless of amount.
+    assert!(!check.is_compliant_with_amount(false, Some(0)));
+    assert!(!check.is_compliant_with_amount(false, Some(1_001)));
 }

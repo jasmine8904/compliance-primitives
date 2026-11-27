@@ -172,11 +172,13 @@ redirect clients to the wrapper's address.
   token).  The wrapper does not mint or burn; it only forwards.
 - **The migration is a deployment + client redirect, not a code change.**
 
-### Pattern B: Cross-contract composition (for denylist-gate and jurisdiction-flag)
+### Pattern B: Cross-contract composition (for denylist-gate, jurisdiction-flag, and allowlist-token)
 
 Modify your token's `transfer` to call `check()` on a deployed
 `denylist-gate` and/or `is_permitted_jurisdiction()` on
-`jurisdiction-flag` before touching balances.  This is the pattern shown in
+`jurisdiction-flag`, and optionally `is_allowed()` on `allowlist-token`, before
+touching balances. `compliance-aggregator` can compose these fixed AND checks.
+This is the pattern shown in
 [`/examples/denylist-gate-consumer`](./examples/denylist-gate-consumer).
 
 - **Best when:** you can deploy a new version of your token contract, or

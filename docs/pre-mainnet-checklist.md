@@ -53,8 +53,9 @@
   the correct pass/fail for all four combinations (both pass, first fails,
   second fails, both fail) under both `CombineOp::All` and `CombineOp::Any`.
 - [ ] `compliance-aggregator` with both `denylist-gate` and
-  `jurisdiction-flag` registered: verify `check_all` returns per-check
-  breakdowns consistent with the individual contract calls.
+  `jurisdiction-flag` registered (and `allowlist-token`, if used): verify
+  `check_all` returns per-check breakdowns consistent with the individual
+  contract calls, and verify verbose checks report expected failure details.
 - [ ] `circuit-breaker` wired as the emergency stop in both `policy-engine`
   and `compliance-aggregator`: verify that freezing the circuit-breaker
   causes both to return failure without calling the underlying checks.
@@ -132,8 +133,8 @@
   - `policy-engine`: each `add_check` call references the correct deployed
     contract address for its check type.
   - `compliance-aggregator`: `set_denylist_gate`, `set_jurisdiction_flag`,
-    and (if used) `set_circuit_breaker` reference the correct deployed
-    contract addresses.
+    `set_allowlist` (if used), and `set_circuit_breaker` (if used) reference
+    the correct deployed contract addresses.
 - [ ] Pause state: all contracts are in the unpaused state before go-live
   (unless intentionally paused for a delayed launch).
 
